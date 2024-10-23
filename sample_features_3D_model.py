@@ -12,8 +12,12 @@ from pytorch3d.renderer import (
 )
 import math
 
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+
 class ModelViewer:
-    def __init__(self, obj_path):
+    def __init__(self, obj_path, auto_scan=False, scan_distance=5.0):
         if torch.cuda.is_available():
             self.device = torch.device("cuda:0")
             print("Using GPU")
@@ -30,8 +34,10 @@ class ModelViewer:
         print(f"Loaded mesh with {self.meshes.verts_packed().shape[0]} vertices")
         print(f"Number of faces: {self.meshes.faces_packed().shape[0]}")
 
+        self.auto_scan = auto_scan
         # Initialize view parameters
-        self.distance = 3.0
+        self.scan_distance = scan_distance
+        self.distance = self.scan_distance
         self.elevation = 0.0
         self.azimuth = 0.0
         self.yaw = 0.0
@@ -44,6 +50,7 @@ class ModelViewer:
         # Initialize feature storage
         self.feature_points = []  # List of dictionaries containing feature info
         self.total_features = 0   # Counter for total features stored
+        self.stored_3d_points = []
 
         self.init_renderer()
 
@@ -54,8 +61,8 @@ class ModelViewer:
         )
 
         self.raster_settings = RasterizationSettings(
-            image_size=1024, 
-            blur_radius=0.0, 
+            image_size=512,
+            blur_radius=0.0,
             faces_per_pixel=1,
             bin_size=None,
             max_faces_per_bin=None
@@ -192,7 +199,7 @@ class ModelViewer:
             else:
                 print(f"No point found at pixel ({x}, {y})")
 
-    def detect_sift_features(self, nfeatures=1000, contrast_threshold=0.05, edge_threshold=10):
+    def detect_sift_features(self, nfeatures=1000, contrast_threshold=0.1, edge_threshold=10):
         """
         Detect SIFT features with balanced parameters.
         Args:
@@ -273,8 +280,8 @@ class ModelViewer:
 
         # Configure FLANN parameters
         FLANN_INDEX_KDTREE = 1
-        index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-        search_params = dict(checks=50)
+        index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=10)
+        search_params = dict(checks=20)
 
         # Create FLANN matcher
         flann = cv2.FlannBasedMatcher(index_params, search_params)
@@ -323,11 +330,111 @@ class ModelViewer:
         y_offset = 30
         for text in info_text:
             cv2.putText(img_with_keypoints, text,
-                       (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+                       (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
             y_offset += 25
         
         return img_with_keypoints
+    
+    def visualize_3d_points(self, current_points):
 
+        # Create new figure
+        fig = plt.figure(figsize=(10, 10))
+        ax = fig.add_subplot(111, projection='3d')
+
+        # Get mesh vertices
+        verts = self.meshes.verts_packed().cpu().numpy()
+        
+        # Plot subsampled mesh vertices
+        stride = max(1, len(verts) // 1000)  # Subsample vertices
+        ax.scatter(verts[::stride, 0], 
+                  verts[::stride, 1], 
+                  verts[::stride, 2], 
+                  c='gray', alpha=0.2, s=1, label='Mesh')
+
+        # Plot stored points if any exist
+        if self.stored_3d_points:
+            stored_points = np.array(self.stored_3d_points)
+            ax.scatter(stored_points[:, 0], 
+                      stored_points[:, 1], 
+                      stored_points[:, 2],
+                      c='green', s=20, 
+                      alpha=0.5,
+                      label=f'Stored ({len(stored_points)})')
+
+        # Plot current points
+        ax.scatter(current_points[:, 0], 
+                  current_points[:, 1], 
+                  current_points[:, 2],
+                  c='red', s=50, 
+                  label=f'Current ({len(current_points)})')
+
+        
+        ax.set_box_aspect([1,1,1])
+
+        ax.set_xlim([-1, 1])
+        ax.set_ylim([-1, 1])
+        ax.set_zlim([-1, 1])
+        # Labels and title
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        ax.set_title('3D Point Visualization')
+        
+        # Add legend
+        ax.legend()
+        
+        # Show the plot
+        plt.show()
+
+    def decluster_points(self, voxel_size=0.05):
+        """
+        Decluster points using a voxel grid approach.
+        Args:
+            voxel_size: Size of voxels for declustering
+        """
+        if not self.stored_3d_points or not self.feature_points:
+            print("No features to decluster")
+            return
+
+        print(f"\nDeclustering with voxel size: {voxel_size}")
+        print(f"Initial points: {len(self.stored_3d_points)}")
+
+        points = np.array(self.stored_3d_points)
+
+        # Create voxel grid indices
+        voxel_indices = np.floor(points / voxel_size).astype(int)
+        
+        # Create dictionary to store points and corresponding features for each voxel
+        voxel_dict = {}
+        
+        for idx, (point, feature) in enumerate(zip(points, self.feature_points)):
+            voxel_idx = tuple(voxel_indices[idx])
+            if voxel_idx not in voxel_dict:
+                voxel_dict[voxel_idx] = []
+            voxel_dict[voxel_idx].append((point, feature))
+
+        # Keep strongest feature in each voxel
+        new_points = []
+        new_features = []
+        
+        for voxel_points in voxel_dict.values():
+            # Sort points in this voxel by response strength
+            voxel_points.sort(key=lambda x: x[1]['response'], reverse=True)
+            # Keep the strongest point
+            best_point, best_feature = voxel_points[0]
+            new_points.append(best_point)
+            new_features.append(best_feature)
+
+        # Update stored points and features
+        self.stored_3d_points = new_points
+        self.feature_points = new_features
+
+        print(f"Points after declustering: {len(self.stored_3d_points)}")
+        print(f"Reduction ratio: {len(self.stored_3d_points)/len(points):.2f}")
+
+        # Visualize the declustered points
+        self.visualize_3d_points(np.array([[0.0, 0.0, 0.0]]))
+        
     def compute_feature_3d_points(self, keypoints, descriptors):
         """
         Compute 3D points for given keypoints and store feature information.
@@ -376,15 +483,188 @@ class ModelViewer:
         
         # Add new features to storage
         self.feature_points.extend(new_features)
+        self.stored_3d_points.extend(points3d)
         
-        print(f"Found {len(points3d)} valid features with 3D points")
-        print(f"Total stored features: {len(self.feature_points)}")
+        # print(f"Found {len(points3d)} valid features with 3D points")
+        # print(f"Total stored features: {len(self.feature_points)}")
         
         return np.array(points3d), np.array(valid_descriptors), valid_keypoints
+    
+    def grid_capture(self, elevation_range=(-45, 45), elevation_steps=5,
+                         yaw_range=(-45, 45), yaw_steps=5,
+                         save_path="grid_features"):
+        """
+        Systematically capture features from a grid of viewpoints.
+        Args:
+            elevation_range: (min, max) elevation angles in degrees
+            elevation_steps: number of elevation steps
+            yaw_range: (min, max) yaw angles in degrees
+            yaw_steps: number of yaw steps
+            save_path: path to save features
+        """
+        print("\nStarting systematic capture...")
+        print(f"Elevation range: {elevation_range}, steps: {elevation_steps}")
+        print(f"Yaw range: {yaw_range}, steps: {yaw_steps}")
+
+        # Clear existing features
+        self.feature_points = []
+        self.stored_3d_points = []
+        self.total_features = 0
+
+        # Create grid of viewpoints
+        elevations = np.arange(elevation_range[0], elevation_range[1], elevation_steps)
+        yaws = np.arange(yaw_range[0], yaw_range[1], yaw_steps)
+
+        total_views = len(elevations) * len(yaws)
+        view_count = 0
+
+        # Store original view parameters
+        orig_elevation = self.elevation
+        orig_yaw = self.yaw
+
+        try:
+            for elevation in elevations:
+                for yaw in yaws:
+                    view_count += 1
+                    print(f"\nProcessing view {view_count}/{total_views}")
+                    print(f"Elevation: {elevation:.1f}, Yaw: {yaw:.1f}")
+
+                    # Set view parameters
+                    self.elevation = elevation
+                    self.yaw = yaw
+
+                    # Render the view
+                    image = self.render_frame()
+                    
+                    # Detect and store features
+                    keypoints, descriptors = self.detect_sift_features()
+                    if keypoints is not None:
+                        points3d, descriptors, keypoints = self.compute_feature_3d_points(
+                            keypoints, descriptors)
+                        if points3d is not None:
+                            image_with_keypoints = self.visualize_features(keypoints)
+                            cv2.imshow("Saved Features", image_with_keypoints)
+                            print(f"Added {len(points3d)} features from this view")
+
+                    # Optional: show current view
+                    cv2.imshow("Grid Sampling", image)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):  # Allow early termination
+                        raise KeyboardInterrupt
+
+            # After capturing all views
+            print("\nCapture complete!")
+            print(f"Total features collected: {len(self.feature_points)}")
+            
+            # Optional: decluster points
+            if len(self.feature_points) > 0:
+                print("\nDeclustering points...")
+                self.decluster_points()
+                
+                # Save features
+                print(f"\nSaving features to {save_path}")
+                self.save_feature_points(save_path)
+
+        except KeyboardInterrupt:
+            print("\nCapture interrupted by user")
+
+        finally:
+            # Restore original view
+            self.elevation = orig_elevation
+            self.yaw = orig_yaw
+            self.render_frame()
+    
+    def save_feature_points(self, filepath):
+        """
+        Save feature points to a .npz file
+        Args:
+            filepath: Path to save the feature points (without extension)
+        """
+        # Convert feature points to saveable format
+        save_data = []
+        for feat in self.feature_points:
+            # Convert keypoint to its basic attributes
+            kp = feat['keypoint']
+            keypoint_data = {
+                'pt': kp.pt,
+                'size': kp.size,
+                'angle': kp.angle,
+                'response': kp.response,
+                'octave': kp.octave,
+                'class_id': kp.class_id
+            }
+            
+            # Create saveable feature dict
+            save_feat = {
+                'id': feat['id'],
+                'descriptor': feat['descriptor'],
+                'point3d': feat['point3d'],
+                'keypoint': keypoint_data,
+                'response': feat['response'],
+                'size': feat['size'],
+                'angle': feat['angle'],
+                'octave': feat['octave']
+            }
+            save_data.append(save_feat)
+        
+        # Save to file
+        np.savez_compressed(
+            filepath,
+            feature_points=save_data,
+            stored_3d_points=np.array(self.stored_3d_points),
+            total_features=self.total_features
+        )
+        print(f"Saved {len(self.feature_points)} features to {filepath}.npz")
+
+    def load_feature_points(self, filepath):
+        """
+        Load feature points from a .npz file
+        Args:
+            filepath: Path to the saved feature points (without extension)
+        """
+        # Load the compressed file
+        data = np.load(f"{filepath}.npz", allow_pickle=True)
+        
+        # Load feature points
+        loaded_data = data['feature_points']
+        self.feature_points = []
+        
+        for feat_dict in loaded_data:
+            # Reconstruct keypoint
+            kp_data = feat_dict['keypoint']
+            keypoint = cv2.KeyPoint(
+                x=float(kp_data['pt'][0]),
+                y=float(kp_data['pt'][1]),
+                size=float(kp_data['size']),
+                angle=float(kp_data['angle']),
+                response=float(kp_data['response']),
+                octave=int(kp_data['octave']),
+                class_id=int(kp_data['class_id'])
+            )
+            
+            # Reconstruct feature dictionary
+            feature = {
+                'id': feat_dict['id'],
+                'descriptor': feat_dict['descriptor'],
+                'point3d': feat_dict['point3d'],
+                'keypoint': keypoint,
+                'response': feat_dict['response'],
+                'size': feat_dict['size'],
+                'angle': feat_dict['angle'],
+                'octave': feat_dict['octave']
+            }
+            self.feature_points.append(feature)
+        
+        # Load 3D points and total features
+        self.stored_3d_points = data['stored_3d_points'].tolist()
+        self.total_features = int(data['total_features'])
+        
+        print(f"Loaded {len(self.feature_points)} features from {filepath}.npz")
+        
+        # Visualize loaded points
+        self.visualize_3d_points(np.array([[0.0, 0.0, 0.0]]))
 
     def display(self):
         WINDOW_NAME = '3D Model Viewer (PyTorch3D)'
-        FEATURE_WINDOW = 'Feature Detection'
         
         self.auto_scale_and_center()
         
@@ -398,14 +678,22 @@ class ModelViewer:
         print("W/S: Zoom in/out")
         print("R: Reset view")
         print("Space: Detect and store ORB features")
-        print("D: Detect ORB features only")
-        print("C: Compute 3D points for current features")
+        print("M: Match features with last detected")
         print("Left Click: Sample 3D point")
         print("Q: Quit")
 
         last_keypoints = None
         last_descriptors = None
-        
+
+        if self.auto_scan:
+            self.grid_capture(
+                elevation_range=(-25, 25),
+                elevation_steps=20,
+                yaw_range=(0, 360),
+                yaw_steps=5,
+                save_path="grid_features"
+            )
+
         while True:
             image = self.render_frame()
             cv2.imshow(WINDOW_NAME, image)
@@ -416,25 +704,39 @@ class ModelViewer:
                 break
             elif key == ord('w'):
                 self.distance = max(0.5, self.distance - 0.1)
+                print(f"Distance: {self.distance}")
             elif key == ord('s'):
                 self.distance += 0.1
+                print(f"Distance: {self.distance}")
             elif key == 81:  # Left arrow
                 self.azimuth -= 5
+                print(f"Azimuth: {self.azimuth}")
             elif key == 83:  # Right arrow
                 self.azimuth += 5
+                print(f"Azimuth: {self.azimuth}")
             elif key == 82:  # Up arrow
                 self.elevation = min(90, self.elevation + 5)
+                print(f"Elevation: {self.elevation}")
             elif key == 84:  # Down arrow
                 self.elevation = max(-90, self.elevation - 5)
+                print(f"Elevation: {self.elevation}")
             elif key == ord('a'):
                 self.yaw -= 5
+                print(f"Yaw: {self.yaw}")
             elif key == ord('d'):
                 self.yaw += 5
+                print(f"Yaw: {self.yaw}")
             elif key == ord('r'):
-                self.distance = 3.0
+                self.distance = self.scan_distance
                 self.elevation = 0.0
                 self.azimuth = 0.0
                 self.yaw = 0.0
+            elif key == ord('c'):  # Save feature points
+                self.save_feature_points("grid_features")
+            elif key == ord('v'):  # Load feature points
+                self.load_feature_points("grid_features")
+            elif key == ord('o'):  # Filter and keep best features
+                self.decluster_points()
             elif key == ord(' '):  # Space bar - detect and store SIFT features
                 last_keypoints, last_descriptors = self.detect_sift_features()
                 if last_keypoints is not None:
@@ -444,12 +746,13 @@ class ModelViewer:
                         image_with_keypoints = self.visualize_features(keypoints)
                         cv2.imshow("Saved Features", image_with_keypoints)
             elif key == ord('m'):  # Match features
-                last_keypoints, last_descriptors = self.detect_sift_features()
-                if last_keypoints is not None and last_descriptors is not None:
-                    matches = self.find_matching_points(last_descriptors)
+                keypoints, descriptors = self.detect_sift_features()
+                if keypoints is not None and descriptors is not None:
+                    matches = self.find_matching_points(descriptors)
                     if matches:
                         matched_indices = [m[0] for m in matches]
-                        image_with_keypoints_matched = self.visualize_features(last_keypoints, matched_indices)
+                        image_with_keypoints_matched = self.visualize_features(keypoints, matched_indices)
+                        self.visualize_3d_points(np.array([m[1]['point3d'] for m in matches]))
                         cv2.imshow("Matched Features", image_with_keypoints_matched)
                     else:
                         print("No matches found")
@@ -458,11 +761,13 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description='3D Model Viewer using PyTorch3D')
     parser.add_argument('--obj', required=True, help='Path to the OBJ file')
+    parser.add_argument('--auto_scan', action='store_true', help='Automatically scan the object and save the feature points')
+    parser.add_argument('--scan_distance', type=float, default=6.0, help='Distance to scan the object')
     
     args = parser.parse_args()
     
     try:
-        viewer = ModelViewer(args.obj)
+        viewer = ModelViewer(args.obj, args.auto_scan, args.scan_distance)
         viewer.display()
     except Exception as e:
         print(f"Error: {str(e)}")
