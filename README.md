@@ -1,6 +1,6 @@
 # MOMPED: Multi-Object Multimodal Pose Estimation and Detection
 
-![MOMPED](assets/mom_on_a_moped.webp)
+<img src="assets/mom_on_a_moped.webp" alt="MOMPED" width="300"/>
 
 MOMPED is a Python library for 3D object pose estimation using multimodal data (RGB-D and 3D models). It provides tools for:
 - Feature extraction from 3D models
@@ -26,7 +26,7 @@ MOMPED is a Python library for 3D object pose estimation using multimodal data (
 
 ```bash
 # Clone the repository
-git clone https://github.com/alexlin51/momped.git
+git clone https://github.com/alexlin2/momped.git
 cd momped
 
 # Install dependencies
@@ -117,6 +117,6 @@ If you use this work in your research, please cite:
   author = {Alex Lin},
   title = {MOMPED: Multi-Object Multimodal Pose Estimation and Detection},
   year = {2024},
-  url = {https://github.com/alexlin51/momped}
+  url = {https://github.com/alexlin2/momped}
 }
 ```
