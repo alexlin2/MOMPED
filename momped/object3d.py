@@ -283,6 +283,20 @@ class Object3D:
         t = centroid_B - R @ centroid_A
 
         return R, t
+
+    # def estimate_rigid_transform_3d(self, object_points, estimated_points):
+    #     a1 = np.column_stack((object_points,np.ones(object_points.shape[0])))
+    #     b1 = np.column_stack((estimated_points,np.ones(estimated_points.shape[0])))
+
+    #     matrixA = np.tensordot(a1,a1.T,axes=[0,1])
+    #     matrixR = np.tensordot(a1,b1.T,axes=[0,1])
+    #     matrixAinv = np.linalg.inv(matrixA)
+
+    #     tm = np.tensordot(matrixAinv,matrixR,axes=1).transpose()
+    #     R = tm[:3,:3]
+    #     t = tm[:3,3]
+
+    #     return R, t
     
     def estimate_transform(self, obj_points, est_points, ransac_threshold=0.01):
         """
