@@ -1,6 +1,6 @@
 import numpy as np
 import cv2
-from utils import detect_sift_features, find_matching_points
+from momped.utils import detect_sift_features, find_matching_points
 import matplotlib
 from mpl_toolkits.mplot3d import Axes3D
 matplotlib.use('TkAgg')
@@ -208,17 +208,16 @@ class Object3D:
         Returns:
             image with visualized features
         """
-        img_with_keypoints = image.copy()
         
         # Detect features in current image
         keypoints, _ = detect_sift_features(image)
         
         if keypoints is None:
-            return img_with_keypoints
+            return image
         
         if matched_points is None:
             # Draw all keypoints in green
-            cv2.drawKeypoints(image, keypoints, img_with_keypoints, 
+            cv2.drawKeypoints(image, keypoints, image, 
                             color=(0,255,0), 
                             flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
         else:
@@ -227,7 +226,7 @@ class Object3D:
                           for pt in matched_points]
             
             # Draw matched keypoints in red
-            cv2.drawKeypoints(image, matched_kps, img_with_keypoints,
+            cv2.drawKeypoints(image, matched_kps, image,
                             color=(0,0,255),
                             flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
         
@@ -239,12 +238,10 @@ class Object3D:
         
         y_offset = 30
         for text in info_text:
-            cv2.putText(img_with_keypoints, text,
+            cv2.putText(image, text,
                        (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 
                        0.7, (0,0,255), 2)
             y_offset += 25
-        
-        return img_with_keypoints
     
     def estimate_transform(self, obj_points, est_points, correspondence_threshold=0.05):
         """
@@ -261,7 +258,7 @@ class Object3D:
         """
         
         if len(obj_points) != len(est_points) or len(obj_points) < 5:
-            return None, None
+            return None, None, None
 
         # Ensure points are float32
         obj_points = obj_points.astype(np.float32)
@@ -288,7 +285,7 @@ class Object3D:
                 estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
                 ransac_n=n,
                 criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(
-                    max_iteration=1000000,
+                    max_iteration=1000,
                     confidence=0.99
                 )
             )
@@ -480,36 +477,34 @@ if __name__ == "__main__":
         print("Converting depth image to float32")
         depth_image = depth_image.astype(np.float32) / 1000.0  # Assuming depth is in millimeters
     
+    start_time = time.time()
     # Get matching points
     img_pts, obj_pts = obj.match_image_points(image, mask)
     
     if img_pts is not None:
         print(f"Found {len(img_pts)} matching points")
-        
-        # Visualize 2D matches
-        vis_img = obj.visualize_matches(image, img_pts)
-        cv2.imshow("Matches", vis_img)
-        cv2.waitKey(1)
 
-        # Estimate 3D points
         real_pts, valid_indices = obj.estimate3d(img_pts, depth_image, camera_matrix, None)
-
-        # Visualize 3D points
         obj_pts = obj_pts[valid_indices]
-        obj.visualize_3d_points(obj.feature_points, obj_pts)
-        obj.visualize_3d_points(current_points=real_pts)
 
-
-        start_time = time.time()
         R, t, inliers = obj.estimate_transform(
             obj_points=obj_pts,
             est_points=real_pts,
-            correspondence_threshold=0.01  # 1cm threshold
+            correspondence_threshold=0.05  # 1cm threshold
         )
         end_time = time.time()
-
         print(f"Transformation estimation took {end_time - start_time:.4f} seconds")
 
+        # Visualize 2D matches
+        vis_img = image.copy()
+        obj.visualize_matches(vis_img, img_pts)
+        cv2.imshow("Matches", vis_img)
+        cv2.waitKey(1)
+
+        # Visualize 3D points
+        obj.visualize_3d_points(obj.feature_points, obj_pts)
+        obj.visualize_3d_points(current_points=real_pts)
+        
         if R is not None:
             # Compute alignment error
             errors, rmse = obj.compute_transform_error(

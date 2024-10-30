@@ -77,8 +77,8 @@ def find_matching_points(feature_points, query_descriptors):
 
     # Configure FLANN parameters
     FLANN_INDEX_KDTREE = 1
-    index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=16)
-    search_params = dict(checks=100)
+    index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=8)
+    search_params = dict(checks=50)
 
     # Create FLANN matcher
     flann = cv2.FlannBasedMatcher(index_params, search_params)
