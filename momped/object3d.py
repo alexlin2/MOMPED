@@ -1,6 +1,13 @@
 import numpy as np
 import cv2
-from momped.utils import detect_sift_features, find_matching_points
+from momped.utils import (
+    detect_sift_features, 
+    find_matching_points, 
+    visualize_alignment, 
+    compute_reprojection_error, 
+    draw_frame_axes, 
+    compute_transform_error
+)
 import matplotlib
 from mpl_toolkits.mplot3d import Axes3D
 matplotlib.use('TkAgg')
@@ -135,115 +142,148 @@ class Object3D:
 
         Z = depth_image[xy[:, 1], xy[:, 0]]
         depth_mask = Z > 0
-        Z = Z[depth_mask]
-        filtered_points = image_points[depth_mask]
 
         # Back-project to 3D (vectorized)
-        X = (filtered_points[:, 0] - cx) * Z / fx
-        Y = (filtered_points[:, 1] - cy) * Z / fy
+        X = (image_points[:, 0] - cx) * Z / fx
+        Y = (image_points[:, 1] - cy) * Z / fy
         
         return np.column_stack((X, Y, Z)), depth_mask
-    
-
-    def visualize_3d_points(self, feature_points=None, current_points=None):
-        """
-        Visualize stored and current 3D points.
-        Args:
-            feature_points: Optional list of stored feature points to visualize
-            current_points: Optional numpy array of current 3D points to visualize
-        """
-        # Create new figure
-        fig = plt.figure(figsize=(10, 10))
-        ax = fig.add_subplot(111, projection='3d')
-
-        # Plot current points if provided
-        if current_points is not None and len(current_points) > 0:
-            ax.scatter(current_points[:, 0], 
-                      current_points[:, 1], 
-                      current_points[:, 2],
-                      c='red', s=75,
-                      label=f'Current ({len(current_points)})')
-    
-        # Plot stored points
-        if feature_points is not None and len(feature_points) > 0:
-            stored_points = np.array([f['point3d'] for f in feature_points])
-            ax.scatter(stored_points[:, 0], 
-                    stored_points[:, 1], 
-                    stored_points[:, 2],
-                    c='green', s=20, 
-                    alpha=0.5,
-                    label=f'Stored ({len(stored_points)})')
-
-        all_points = np.vstack([stored_points, current_points]) if feature_points is not None else current_points
-
-        # Set equal aspect ratio
-        ax.set_box_aspect([1,1,1])
-
-        # Auto-scale limits
+ 
+    def estimate_transform(self, img_pts, obj_pts, real_pts, camera_matrix, dist_coeffs=None):
         
-        min_val = np.min(all_points)
-        max_val = np.max(all_points)
-        ax.set_xlim([min_val, max_val])
-        ax.set_ylim([min_val, max_val])
-        ax.set_zlim([min_val, max_val])
+        R_pnp, t_pnp, inliers = obj.estimate_pnp_ransac(
+                            image_points=img_pts,
+                            object_points=obj_pts,
+                            camera_matrix=camera_matrix,
+                            dist_coeffs=dist_coeffs,
+                            ransac_threshold=10.0,
+                            confidence=0.99,
+                            max_iters=1000
+                        )
+        
+        filtered_obj_pts = obj_pts[inliers]
+        filtered_real_pts = real_pts[inliers]
 
-        # Labels and title
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.set_title('3D Point Visualization')
-        
-        # Add legend
-        ax.legend()
-        
-        # Show the plot
-        plt.show()
+        R_rigid, t_rigid = obj.estimate_rigid_transform_3d(filtered_obj_pts, filtered_real_pts)
 
-    def visualize_matches(self, image, matched_points=None):
-        """
-        Visualize feature matches on the image.
-        Args:
-            image: Input image
-            matched_points: Optional array of 2D points to highlight
-        Returns:
-            image with visualized features
-        """
-        
-        # Detect features in current image
-        keypoints, _ = detect_sift_features(image)
-        
-        if keypoints is None:
-            return image
-        
-        if matched_points is None:
-            # Draw all keypoints in green
-            cv2.drawKeypoints(image, keypoints, image, 
-                            color=(0,255,0), 
-                            flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+        _, rmse_1 = compute_transform_error(
+            obj_points=filtered_obj_pts,
+            est_points=filtered_real_pts,
+            R=R_rigid,
+            t=t_rigid
+        )
+
+        _, rmse_2 = compute_transform_error(
+            obj_points=filtered_obj_pts,
+            est_points=filtered_real_pts,
+            R=R_pnp,
+            t=t_pnp
+        )
+
+        _, rmse_3 = compute_transform_error(
+            obj_points=filtered_obj_pts,
+            est_points=filtered_real_pts,
+            R=R_pnp,
+            t=t_rigid
+        )
+
+        print(f"Rigid RMSE: {rmse_1:.3f}, PnP RMSE: {rmse_2:.3f}, Combined RMSE: {rmse_3:.3f}")
+
+        min_rmse = min(rmse_1, rmse_2, rmse_3)
+
+        if min_rmse == rmse_1:
+            return R_rigid, t_rigid, inliers
+        elif min_rmse == rmse_2:
+            return R_pnp, t_pnp, inliers
         else:
-            # Convert matched points to keypoints format
-            matched_kps = [cv2.KeyPoint(x=pt[0], y=pt[1], size=10) 
-                          for pt in matched_points]
+            return R_pnp, t_rigid, inliers
+
+
+    def estimate_pnp_ransac(self, image_points, object_points, camera_matrix, dist_coeffs=None, 
+                       ransac_threshold=10.0, confidence=0.99, max_iters=1000):
+        """
+        Estimate 6D pose using PnP RANSAC.
+        """
+
+        if len(image_points) != len(object_points) or len(image_points) < 4:
+            return None, None, None
             
-            # Draw matched keypoints in red
-            cv2.drawKeypoints(image, matched_kps, image,
-                            color=(0,0,255),
-                            flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+        # Ensure points are float32
+        image_points = image_points.astype(np.float32)
+        object_points = object_points.astype(np.float32)
         
-        # Add text information
-        info_text = [
-            f'Total Features: {len(keypoints)}',
-            f'Matched: {len(matched_points) if matched_points is not None else 0}'
-        ]
+        # If no distortion coefficients provided, use zero distortion
+        if dist_coeffs is None:
+            dist_coeffs = np.zeros(4, dtype=np.float32)
+            
+        try:
+            # Estimate pose using RANSAC
+            
+            retval, rvec, tvec, inliers = cv2.solvePnPRansac(
+                objectPoints=object_points,
+                imagePoints=image_points,
+                cameraMatrix=camera_matrix,
+                distCoeffs=dist_coeffs,
+                flags=cv2.SOLVEPNP_EPNP,
+                iterationsCount=max_iters,
+                reprojectionError=ransac_threshold,
+                confidence=confidence,
+                inliers=None
+            )
+            
+            if not retval or inliers is None:
+                print("PnP RANSAC failed to converge")
+                return None, None, None
+                
+            # Convert rotation vector to matrix
+            R, _ = cv2.Rodrigues(rvec)
+            t = tvec.reshape(3)
+            
+            # Create inlier mask
+            inlier_mask = np.zeros(len(image_points), dtype=bool)
+            inlier_mask[inliers.ravel()] = True
+            
+            return R, t, inlier_mask
         
-        y_offset = 30
-        for text in info_text:
-            cv2.putText(image, text,
-                       (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 
-                       0.7, (0,0,255), 2)
-            y_offset += 25
+        except cv2.error as e:
+            print(f"OpenCV Error in solvePnPRansac: {e}")
+            return None, None, None
+        except Exception as e:
+            print(f"Error in estimate_pnp_ransac: {e}")
+            return None, None, None
     
-    def estimate_transform(self, obj_points, est_points, correspondence_threshold=0.05):
+    def estimate_rigid_transform_3d(self, object_points, estimated_points):
+        """
+        Estimate a 3D rigid transformation (rotation and translation) that aligns 
+        set of points A to set of points B.
+        Parameters:
+            A (np.ndarray): Source points, shape (N, 3).
+            B (np.ndarray): Destination points, shape (N, 3).
+        Returns:
+            R (np.ndarray): 3x3 rotation matrix.
+            t (np.ndarray): 3x1 translation vector.
+        """
+        assert object_points.shape == estimated_points.shape, "A and B must be of the same shape"
+        # Calculate centroids
+        centroid_A = np.mean(object_points, axis=0)
+        centroid_B = np.mean(estimated_points, axis=0)
+        # Center the points
+        AA = object_points - centroid_A
+        BB = estimated_points - centroid_B
+        # Calculate covariance matrix
+        H = AA.T @ BB
+        # Perform SVD
+        U, S, Vt = np.linalg.svd(H)
+        R = Vt.T @ U.T
+        # Handle special reflection case
+        if np.linalg.det(R) < 0:
+            Vt[2, :] *= -1
+            R = Vt.T @ U.T
+        # Calculate translation
+        t = centroid_B - R @ centroid_A
+        return R, t
+
+    def estimate_transform_ransac(self, obj_points, est_points, correspondence_threshold=0.05):
         """
         Estimate rigid transform between object points and estimated points using Open3D's RANSAC.
         
@@ -315,225 +355,149 @@ class Object3D:
 
         return best_R, best_t, best_inliers
 
-    def compute_transform_error(self, obj_points, est_points, R, t):
-        """
-        Compute error between transformed object points and estimated points.
-        Note: obj_points are source, est_points are destination (matching estimateAffine3D)
-        
-        Args:
-            obj_points: Nx3 array of object points (source)
-            est_points: Nx3 array of estimated points (destination)
-            R: 3x3 rotation matrix
-            t: 3x1 translation vector
-            
-        Returns:
-            errors: Nx1 array of point-wise distances
-            rmse: Root mean square error
-        """
-        # Convert inputs to numpy arrays and ensure correct shape
-        R = np.asarray(R)
-        t = np.asarray(t).reshape(3)
-        obj_points = np.asarray(obj_points)
-        est_points = np.asarray(est_points)
-        
-        # Transform object points
-        transformed_points = (R @ obj_points.T).T + t
-        
-        # Compute distances to estimated points
-        errors = np.linalg.norm(est_points - transformed_points, axis=1)
-        rmse = np.sqrt(np.mean(errors**2))
-        
-        return errors, rmse
-
-    def visualize_alignment(self, obj_points, est_points, R, t):
-        """
-        Visualize alignment between transformed object points and estimated points.
-        Note: obj_points are source, est_points are destination (matching estimateAffine3D)
-        
-        Args:
-            obj_points: Nx3 array of object points (source, green)
-            est_points: Nx3 array of estimated points (destination, blue)
-            R: 3x3 rotation matrix
-            t: 3x1 translation vector
-        """
-        fig = plt.figure(figsize=(10, 10))
-        ax = fig.add_subplot(111, projection='3d')
-
-        # Transform object points
-        transformed_points = (R @ obj_points.T).T + t
-
-        # Plot transformed object points
-        ax.scatter(transformed_points[:, 0], 
-                  transformed_points[:, 1], 
-                  transformed_points[:, 2],
-                  c='green', s=25, alpha=0.5,
-                  label='Transformed Object Points')
-
-        # Plot estimated points
-        ax.scatter(est_points[:, 0], 
-                  est_points[:, 1], 
-                  est_points[:, 2],
-                  c='red', s=50, alpha=1.0,
-                  label='Estimated Points (destination)')
-
-        # Set equal aspect ratio
-        ax.set_box_aspect([1,1,1])
-
-        # Auto-scale limits
-        all_points = np.vstack([obj_points, transformed_points, est_points])
-        min_val = np.min(all_points)
-        max_val = np.max(all_points)
-        ax.set_xlim([min_val, max_val])
-        ax.set_ylim([min_val, max_val])
-        ax.set_zlim([min_val, max_val])
-
-        # Labels
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.set_title('Point Cloud Alignment')
-        
-        # Add transformation info
-        euler_angles = cv2.RQDecomp3x3(R)[0]
-        info_text = f'Rotation (deg): {euler_angles[0]:.1f}, {euler_angles[1]:.1f}, {euler_angles[2]:.1f}\n'
-        info_text += f'Translation (m): {t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}'
-        plt.figtext(0.02, 0.98, info_text, fontsize=10, va='top')
-        
-        ax.legend()
-        plt.show()
-
-    def draw_frame_axes(self, image, R, t, camera_matrix, dist_coeffs=None, axis_length=0.1):
-        """
-        Draw coordinate axes in image using estimated transformation.
-        
-        Args:
-            image: Input image
-            transform: 3x4 transformation matrix [R|t]
-            camera_matrix: 3x3 camera intrinsic matrix
-            dist_coeffs: Distortion coefficients (optional)
-            axis_length: Length of axes in meters
-            
-        Returns:
-            image_with_axes: Image with drawn coordinate axes
-        """
-        # Convert R to rotation vector
-        rvec = cv2.Rodrigues(R)[0]
-        tvec = t
-
-        # Draw axes
-        img_axes = cv2.drawFrameAxes(
-            image.copy(), 
-            camera_matrix, 
-            dist_coeffs if dist_coeffs is not None else np.zeros(4),
-            rvec, 
-            tvec, 
-            axis_length,
-            2  # Line thickness
-        )
-
-        # Add text labels for pose
-        # Convert rotation vector to euler angles (in degrees)
-        euler_angles = cv2.RQDecomp3x3(R)[0]
-        pose_text = [
-            f"Rotation (deg): {euler_angles[0]:.1f}, {euler_angles[1]:.1f}, {euler_angles[2]:.1f}",
-            f"Translation (m): {t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}"
-        ]
-
-        y_offset = 30
-        for text in pose_text:
-            cv2.putText(
-                img_axes,
-                text,
-                (10, y_offset), 
-                cv2.FONT_HERSHEY_SIMPLEX, 
-                0.7,
-                (0, 255, 0),
-                2
-            )
-            y_offset += 30
-
-        return img_axes
-    
-
 # Example usage:
 if __name__ == "__main__":
+    import argparse
+    
+    # Set up argument parser
+    parser = argparse.ArgumentParser(description='Object pose estimation using different methods')
+    parser.add_argument('--method', type=str, default='pnp',
+                       choices=['combined','pnp', 'ransac', 'rigid'],
+                       help='Pose estimation method to use')
+    parser.add_argument('--rgb', type=str, required=True,
+                       help='Path to RGB image')
+    parser.add_argument('--depth', type=str, required=True,
+                       help='Path to depth image')
+    parser.add_argument('--mask', type=str, required=True,
+                       help='Path to mask image')
+    parser.add_argument('--model', type=str, required=True,
+                       help='Path to model NPZ file')
+    parser.add_argument('--visualize', action='store_true',
+                       help='Enable visualization')
+    
+    args = parser.parse_args()
+
     # Initialize object with stored features
-    obj = Object3D("examples/yellow_mustard.npz")
+    obj = Object3D(args.model)
 
-    # Load a test image
-    image = cv2.imread("mustard0/rgb/1581120424100262102.png")
-    depth_image = cv2.imread("mustard0/depth/1581120424100262102.png", cv2.IMREAD_UNCHANGED)
+    # Load images
+    image = cv2.imread(args.rgb)
+    depth_image = cv2.imread(args.depth, cv2.IMREAD_UNCHANGED)
+    mask = cv2.imread(args.mask, cv2.IMREAD_GRAYSCALE)
+    
+    if image is None or depth_image is None or mask is None:
+        print("Error loading images")
+        exit(1)
 
-    # Define the camera matrix
+    # Process mask
+    _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+
+    # Define the camera matrix (should be loaded from calibration)
     camera_matrix = np.array([
         [3.195820007324218750e+02, 0.000000000000000000e+00, 3.202149847676955687e+02],
         [0.000000000000000000e+00, 4.171186828613281250e+02, 2.443486680871046701e+02],
         [0.000000000000000000e+00, 0.000000000000000000e+00, 1.000000000000000000e+00]
     ], dtype=np.float32)
-    mask = cv2.imread("mustard0/masks/1581120424100262102.png", cv2.IMREAD_GRAYSCALE)
-    _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
-    # Convert depth image to float32 if necessary
+
+    # Convert depth image to meters
     if depth_image.dtype != np.float32:
-        print("Converting depth image to float32")
-        depth_image = depth_image.astype(np.float32) / 1000.0  # Assuming depth is in millimeters
-    
+        depth_image = depth_image.astype(np.float32) / 1000.0  # Convert mm to meters
+
     start_time = time.time()
+
     # Get matching points
     img_pts, obj_pts = obj.match_image_points(image, mask)
     
     if img_pts is not None:
         print(f"Found {len(img_pts)} matching points")
 
-        real_pts, valid_indices = obj.estimate3d(img_pts, depth_image, camera_matrix, None)
-        obj_pts = obj_pts[valid_indices]
-
-        R, t, inliers = obj.estimate_transform(
-            obj_points=obj_pts,
-            est_points=real_pts,
-            correspondence_threshold=0.05  # 1cm threshold
-        )
-        end_time = time.time()
-        print(f"Transformation estimation took {end_time - start_time:.4f} seconds")
-
-        # Visualize 2D matches
-        vis_img = image.copy()
-        obj.visualize_matches(vis_img, img_pts)
-        cv2.imshow("Matches", vis_img)
-        cv2.waitKey(1)
-
-        # Visualize 3D points
-        obj.visualize_3d_points(obj.feature_points, obj_pts)
-        obj.visualize_3d_points(current_points=real_pts)
+        # Get 3D points from depth
+        real_pts, valid_indices = obj.estimate3d(img_pts, depth_image, camera_matrix)
         
+        # Filter points based on valid depth values
+        obj_pts = obj_pts[valid_indices]
+        real_pts = real_pts[valid_indices]
+        img_pts = img_pts[valid_indices]
+        
+        print(f"Valid 3D points: {len(real_pts)}")
+
+        # Estimate pose using selected method
+        if args.method == 'combined':
+            R, t, inliers = obj.estimate_transform(
+                img_pts=img_pts,
+                obj_pts=obj_pts,
+                real_pts=real_pts,
+                camera_matrix=camera_matrix
+            )
+        elif args.method == 'pnp':
+            R, t, inliers = obj.estimate_pnp_ransac(
+                image_points=img_pts,
+                object_points=obj_pts,
+                camera_matrix=camera_matrix,
+                ransac_threshold=10.0,
+                confidence=0.99
+            )
+        elif args.method == 'ransac':
+            R, t, inliers = obj.estimate_transform_ransac(
+                obj_points=obj_pts,
+                est_points=real_pts,
+                correspondence_threshold=0.05
+            )
+        else:  # rigid transform
+            R, t = obj.estimate_rigid_transform_3d(obj_pts, real_pts)
+            inliers = np.ones(len(obj_pts), dtype=bool)  # All points used
+
+        end_time = time.time()
+        print(f"Pose estimation ({args.method}) took {end_time - start_time:.4f} seconds")
+
         if R is not None:
-            # Compute alignment error
-            errors, rmse = obj.compute_transform_error(
-                obj_points=obj_pts[inliers],
-                est_points=real_pts[inliers],
+            # Compute and visualize reprojection error
+            if args.method in ['pnp', 'rigid']:
+                errors, rmse, vis_img = compute_reprojection_error(
+                    image_points=img_pts[inliers] if args.method == 'pnp' else img_pts,
+                    object_points=obj_pts[inliers] if args.method == 'pnp' else obj_pts,
+                    R=R,
+                    t=t,
+                    camera_matrix=camera_matrix,
+                    image=image,
+                    visualize=args.visualize
+                )
+                print(f"Reprojection RMSE: {rmse:.3f} pixels")
+                cv2.imshow("Reprojection", vis_img)
+            
+            # Draw coordinate axes
+            img_axes = draw_frame_axes(
+                image=image,
                 R=R,
-                t=t
-            )
-            print(f"RMSE: {rmse*1000:.6f}mm")
-            print(t)
-
-            img_axes = obj.draw_frame_axes(
-            image=image,
-            R=R,
-            t=t,
-            camera_matrix=camera_matrix,
-            dist_coeffs=None,
-            axis_length=0.1  # 10cm axes
+                t=t,
+                camera_matrix=camera_matrix,
+                axis_length=0.1
             )
 
-            cv2.imshow("Pose", img_axes)
-            cv2.waitKey(0)
-
-            stored_points = np.array([f['point3d'] for f in obj.feature_points])
-            # Visualize alignment
-            obj.visualize_alignment(
-                obj_points=stored_points,
-                est_points=real_pts[inliers],
-                R=R,
-                t=t
-            )
+            if args.visualize:
+                # Show matching points
+                pts = img_pts[inliers] if args.method == 'pnp' else img_pts
+                matched_kp = [cv2.KeyPoint(x=pt[0], y=pt[1], size=10) 
+                            for pt in pts]
+                cv2.drawKeypoints(img_axes, matched_kp, img_axes, 
+                                    color=(0,255,0), 
+                                    flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+                
+                # Show pose
+                cv2.imshow("Pose", img_axes)
+                
+                # Show alignment visualization
+                visualize_alignment(
+                    obj_points=obj_pts if args.method == 'rigid' else obj_pts[inliers],
+                    est_points=real_pts if args.method == 'rigid' else real_pts[inliers],
+                    R=R,
+                    t=t
+                )
+                
+                cv2.waitKey(0)
+                cv2.destroyAllWindows()
+        else:
+            print("Pose estimation failed")
+    else:
+        print("No matches found")
 

@@ -56,7 +56,7 @@ img_pts, obj_pts = obj.match_image_points(rgb_image, mask)
 real_pts, valid_indices = obj.estimate3d(img_pts, depth_image, camera_matrix)
 
 # Estimate transformation
-R, t = obj.estimate_transform(obj_pts[valid_indices], real_pts)
+R, t = obj.estimate_transform(obj_pts[valid_indices], real_pts[valid_indices])
 ```
 
 ## File Structure
