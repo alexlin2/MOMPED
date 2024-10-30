@@ -5,6 +5,7 @@ import matplotlib
 from mpl_toolkits.mplot3d import Axes3D
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
+import open3d as o3d
 
 class Object3D:
     def __init__(self, npz_path):
@@ -244,89 +245,64 @@ class Object3D:
         
         return img_with_keypoints
     
-    def estimate_rigid_transform_3d(self, object_points, estimated_points):
+    def estimate_transform(self, obj_points, est_points, ransac_n=5, correspondence_threshold=0.01):
         """
-        Estimate a 3D rigid transformation (rotation and translation) that aligns 
-        set of points A to set of points B.
-
-        Parameters:
-            A (np.ndarray): Source points, shape (N, 3).
-            B (np.ndarray): Destination points, shape (N, 3).
-
-        Returns:
-            R (np.ndarray): 3x3 rotation matrix.
-            t (np.ndarray): 3x1 translation vector.
-        """
-        assert object_points.shape == estimated_points.shape, "A and B must be of the same shape"
-
-        # Calculate centroids
-        centroid_A = np.mean(object_points, axis=0)
-        centroid_B = np.mean(estimated_points, axis=0)
-
-        # Center the points
-        AA = object_points - centroid_A
-        BB = estimated_points - centroid_B
-
-        # Calculate covariance matrix
-        H = AA.T @ BB
-
-        # Perform SVD
-        U, S, Vt = np.linalg.svd(H)
-        R = Vt.T @ U.T
-
-        # Handle special reflection case
-        if np.linalg.det(R) < 0:
-            Vt[2, :] *= -1
-            R = Vt.T @ U.T
-
-        # Calculate translation
-        t = centroid_B - R @ centroid_A
-
-        return R, t
-
-    # def estimate_rigid_transform_3d(self, object_points, estimated_points):
-    #     a1 = np.column_stack((object_points,np.ones(object_points.shape[0])))
-    #     b1 = np.column_stack((estimated_points,np.ones(estimated_points.shape[0])))
-
-    #     matrixA = np.tensordot(a1,a1.T,axes=[0,1])
-    #     matrixR = np.tensordot(a1,b1.T,axes=[0,1])
-    #     matrixAinv = np.linalg.inv(matrixA)
-
-    #     tm = np.tensordot(matrixAinv,matrixR,axes=1).transpose()
-    #     R = tm[:3,:3]
-    #     t = tm[:3,3]
-
-    #     return R, t
-    
-    def estimate_transform(self, obj_points, est_points, ransac_threshold=0.01):
-        """
-        Estimate rigid transform between object points and estimated points.
+        Estimate rigid transform between object points and estimated points using Open3D's RANSAC.
         
         Args:
             obj_points: Nx3 array of 3D points in object frame
             est_points: Nx3 array of estimated 3D points in camera frame
-            ransac: Whether to use RANSAC for robust estimation
             ransac_threshold: RANSAC inlier threshold in meters
             
         Returns:
             R: 3x3 rotation matrix from camera to object frame
             t: 3x1 translation vector from camera to object frame
-            inliers: Indices of inlier points if using RANSAC, None otherwise
         """
+        
         if len(obj_points) != len(est_points) or len(obj_points) < 3:
-            return None, None, None
+            return None, None
 
         # Ensure points are float32
         obj_points = obj_points.astype(np.float32)
         est_points = est_points.astype(np.float32)
 
-        # Use RANSAC for robust estimation
-        R, t = self.estimate_rigid_transform_3d(
-            obj_points,  # Source points (camera frame)
-            est_points,  # Destination points (object frame)
+        # Convert points to Open3D format
+        pcd_obj = o3d.geometry.PointCloud()
+        pcd_est = o3d.geometry.PointCloud()
+        
+        pcd_obj.points = o3d.utility.Vector3dVector(obj_points)
+        pcd_est.points = o3d.utility.Vector3dVector(est_points)
+
+        # Create correspondences (assuming points are already matched)
+        corres = np.array([[i, i] for i in range(len(obj_points))])
+
+        # Perform RANSAC registration
+        result = o3d.pipelines.registration.registration_ransac_based_on_correspondence(
+            source=pcd_obj,
+            target=pcd_est,
+            corres=o3d.utility.Vector2iVector(corres),
+            max_correspondence_distance=correspondence_threshold,
+            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+            ransac_n=ransac_n,
+            criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(
+                max_iteration=10000000,
+                confidence=0.99
+            )
         )
 
-        return R, t
+        if result.transformation is None:
+            return None, None
+        
+        inlier_mask = np.zeros(len(obj_points), dtype=bool)
+        correspondence_set = np.asarray(result.correspondence_set)
+        inlier_mask[correspondence_set[:, 0]] = True
+
+        # Extract rotation and translation from transformation matrix
+        transformation = result.transformation
+        R = transformation[:3, :3]
+        t = transformation[:3, 3]
+
+        return R, t, inlier_mask
 
     def compute_transform_error(self, obj_points, est_points, R, t):
         """
@@ -472,7 +448,7 @@ class Object3D:
 if __name__ == "__main__":
     # Initialize object with stored features
     obj = Object3D("examples/yellow_mustard.npz")
-    
+
     # Load a test image
     image = cv2.imread("mustard0/rgb/1581120424100262102.png")
     depth_image = cv2.imread("mustard0/depth/1581120424100262102.png", cv2.IMREAD_UNCHANGED)
@@ -509,17 +485,17 @@ if __name__ == "__main__":
         obj.visualize_3d_points(obj.feature_points, obj_pts)
         obj.visualize_3d_points(current_points=real_pts)
 
-        R, t = obj.estimate_transform(
+        R, t, inliers = obj.estimate_transform(
         obj_points=obj_pts,
         est_points=real_pts,
-        ransac_threshold=0.01  # 1cm threshold
+        correspondence_threshold=0.01  # 1cm threshold
         )
 
         if R is not None:
             # Compute alignment error
             errors, rmse = obj.compute_transform_error(
-                obj_points=obj_pts,
-                est_points=real_pts,
+                obj_points=obj_pts[inliers],
+                est_points=real_pts[inliers],
                 R=R,
                 t=t
             )
@@ -542,7 +518,7 @@ if __name__ == "__main__":
             # Visualize alignment
             obj.visualize_alignment(
                 obj_points=stored_points,
-                est_points=real_pts,
+                est_points=real_pts[inliers],
                 R=R,
                 t=t
             )
