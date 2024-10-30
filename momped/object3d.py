@@ -6,6 +6,7 @@ from mpl_toolkits.mplot3d import Axes3D
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import open3d as o3d
+import time
 
 class Object3D:
     def __init__(self, npz_path):
@@ -245,7 +246,7 @@ class Object3D:
         
         return img_with_keypoints
     
-    def estimate_transform(self, obj_points, est_points, ransac_n=5, correspondence_threshold=0.01):
+    def estimate_transform(self, obj_points, est_points, correspondence_threshold=0.05):
         """
         Estimate rigid transform between object points and estimated points using Open3D's RANSAC.
         
@@ -259,7 +260,7 @@ class Object3D:
             t: 3x1 translation vector from camera to object frame
         """
         
-        if len(obj_points) != len(est_points) or len(obj_points) < 3:
+        if len(obj_points) != len(est_points) or len(obj_points) < 5:
             return None, None
 
         # Ensure points are float32
@@ -276,33 +277,46 @@ class Object3D:
         # Create correspondences (assuming points are already matched)
         corres = np.array([[i, i] for i in range(len(obj_points))])
 
-        # Perform RANSAC registration
-        result = o3d.pipelines.registration.registration_ransac_based_on_correspondence(
-            source=pcd_obj,
-            target=pcd_est,
-            corres=o3d.utility.Vector2iVector(corres),
-            max_correspondence_distance=correspondence_threshold,
-            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
-            ransac_n=ransac_n,
-            criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(
-                max_iteration=10000000,
-                confidence=0.99
+        best_rmse = np.inf
+        for n in range(3, len(obj_points)-1):
+            # Perform RANSAC registration
+            result = o3d.pipelines.registration.registration_ransac_based_on_correspondence(
+                source=pcd_obj,
+                target=pcd_est,
+                corres=o3d.utility.Vector2iVector(corres),
+                max_correspondence_distance=correspondence_threshold,
+                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+                ransac_n=n,
+                criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(
+                    max_iteration=1000000,
+                    confidence=0.99
+                )
             )
-        )
+            
+            inlier_mask = np.zeros(len(obj_points), dtype=bool)
+            correspondence_set = np.asarray(result.correspondence_set)
+            inlier_mask[correspondence_set[:, 0]] = True
 
-        if result.transformation is None:
-            return None, None
-        
-        inlier_mask = np.zeros(len(obj_points), dtype=bool)
-        correspondence_set = np.asarray(result.correspondence_set)
-        inlier_mask[correspondence_set[:, 0]] = True
+            # Extract rotation and translation from transformation matrix
+            transformation = result.transformation
+            R = transformation[:3, :3]
+            t = transformation[:3, 3]
 
-        # Extract rotation and translation from transformation matrix
-        transformation = result.transformation
-        R = transformation[:3, :3]
-        t = transformation[:3, 3]
+            # Compute alignment error
+            _, rmse = self.compute_transform_error(
+                obj_points=obj_points,
+                est_points=est_points,
+                R=R,
+                t=t
+            )
 
-        return R, t, inlier_mask
+            if rmse < best_rmse:
+                best_rmse = rmse
+                best_R = R
+                best_t = t
+                best_inliers = inlier_mask
+
+        return best_R, best_t, best_inliers
 
     def compute_transform_error(self, obj_points, est_points, R, t):
         """
@@ -485,11 +499,16 @@ if __name__ == "__main__":
         obj.visualize_3d_points(obj.feature_points, obj_pts)
         obj.visualize_3d_points(current_points=real_pts)
 
+
+        start_time = time.time()
         R, t, inliers = obj.estimate_transform(
-        obj_points=obj_pts,
-        est_points=real_pts,
-        correspondence_threshold=0.01  # 1cm threshold
+            obj_points=obj_pts,
+            est_points=real_pts,
+            correspondence_threshold=0.01  # 1cm threshold
         )
+        end_time = time.time()
+
+        print(f"Transformation estimation took {end_time - start_time:.4f} seconds")
 
         if R is not None:
             # Compute alignment error
