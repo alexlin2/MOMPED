@@ -74,21 +74,36 @@ class Object3D:
 
     def match_image_points(self, image, mask=None):
         """
-        Match image features with stored 3D points.
+        Match image features with stored 3D points using mask as ROI.
         Args:
             image: Input image
+            mask: Binary mask for ROI
         Returns:
             image_points: 2D points in the image
             object_points: Corresponding 3D points in object space
         """
+        if mask is None:
+            return None, None
 
-        if mask is not None:
-            image = cv2.bitwise_and(image, image, mask=mask)
-        # Use utility function to detect features
-        keypoints, descriptors = detect_sift_features(image)
+        # Find ROI from mask
+        x, y, w, h = cv2.boundingRect(mask)
+        
+        # Extract ROI from image and mask
+        roi = image[y:y+h, x:x+w]
+        roi_mask = mask[y:y+h, x:x+w]
+        
+        # Apply mask to ROI
+        masked_roi = cv2.bitwise_and(roi, roi, mask=roi_mask)
+        
+        # Use utility function to detect features on ROI
+        keypoints, descriptors = detect_sift_features(masked_roi)
         
         if keypoints is None:
             return None, None
+        
+        # Adjust keypoint coordinates back to original image space
+        for kp in keypoints:
+            kp.pt = (kp.pt[0] + x, kp.pt[1] + y)
         
         # Use utility function to find matches
         matches = find_matching_points(self.feature_points, descriptors)
@@ -150,6 +165,10 @@ class Object3D:
         return np.column_stack((X, Y, Z)), depth_mask
  
     def estimate_transform(self, img_pts, obj_pts, real_pts, camera_matrix, dist_coeffs=None):
+        '''
+        Combine PnP RANSAC and rigid transform estimation to get the best pose estimate.
+        uses transform error as loss function to select the best estimate.
+        '''
         
         R_pnp, t_pnp, inliers = obj.estimate_pnp_ransac(
                             image_points=img_pts,
@@ -452,7 +471,7 @@ if __name__ == "__main__":
 
         if R is not None:
             # Compute and visualize reprojection error
-            if args.method in ['pnp', 'rigid']:
+            if args.method in ['pnp', 'combined']:
                 errors, rmse, vis_img = compute_reprojection_error(
                     image_points=img_pts[inliers] if args.method == 'pnp' else img_pts,
                     object_points=obj_pts[inliers] if args.method == 'pnp' else obj_pts,

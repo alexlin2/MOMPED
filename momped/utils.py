@@ -89,7 +89,7 @@ def find_matching_points(feature_points, query_descriptors):
     
     # Apply basic ratio test
     for i, (m, n) in enumerate(matches_flann):
-        if m.distance < 0.95 * n.distance:
+        if m.distance < 0.85 * n.distance:
             matches.append((i, feature_points[m.trainIdx]))
     
     print(f"Found {len(matches)} matches from {len(matches_flann)} potential matches")
