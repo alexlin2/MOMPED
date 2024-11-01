@@ -170,7 +170,7 @@ class Object3D:
         uses transform error as loss function to select the best estimate.
         '''
         
-        R_pnp, t_pnp, inliers = obj.estimate_pnp_ransac(
+        R_pnp, t_pnp, inliers = self.estimate_pnp_ransac(
                             image_points=img_pts,
                             object_points=obj_pts,
                             camera_matrix=camera_matrix,
@@ -183,7 +183,10 @@ class Object3D:
         filtered_obj_pts = obj_pts[inliers]
         filtered_real_pts = real_pts[inliers]
 
-        R_rigid, t_rigid = obj.estimate_rigid_transform_3d(filtered_obj_pts, filtered_real_pts)
+        if len(filtered_obj_pts) < 5:
+            return None, None, None
+
+        R_rigid, t_rigid = self.estimate_rigid_transform_3d(filtered_obj_pts, filtered_real_pts)
 
         _, rmse_1 = compute_transform_error(
             obj_points=filtered_obj_pts,
