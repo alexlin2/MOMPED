@@ -57,7 +57,7 @@ class Object3D:
             feature = {
                 'id': feat_dict['id'],
                 'descriptor': feat_dict['descriptor'],
-                'point3d': feat_dict['point3d'] / 10.0,
+                'point3d': feat_dict['point3d'] / 10.0, # Scale down to meters when in real world
                 'keypoint': keypoint,
                 'response': feat_dict['response'],
                 'size': feat_dict['size'],

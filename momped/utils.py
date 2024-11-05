@@ -1,6 +1,247 @@
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import torch
+from scipy.spatial.transform import Rotation
+
+class FeatureManager:
+    def __init__(self):
+        self.feature_points = []
+        self.stored_3d_points = []
+        self.total_features = 0
+
+    def add_features(self, keypoints, descriptors, points3d):
+        """Add new features to storage."""
+        new_features = []
+        for kp, desc, point3d in zip(keypoints, descriptors, points3d):
+            feature_info = {
+                'id': self.total_features,
+                'descriptor': desc,
+                'point3d': point3d,
+                'keypoint': kp,
+                'response': kp.response,
+                'size': kp.size,
+                'angle': kp.angle,
+                'octave': kp.octave
+            }
+            new_features.append(feature_info)
+            self.total_features += 1
+        
+        self.feature_points.extend(new_features)
+        self.stored_3d_points.extend(points3d)
+        
+        return len(new_features)
+
+    def decluster_points(self, voxel_size=0.05):
+        """Decluster points using a voxel grid approach."""
+        if not self.stored_3d_points or not self.feature_points:
+            print("No features to decluster")
+            return
+
+        points = np.array(self.stored_3d_points)
+        voxel_indices = np.floor(points / voxel_size).astype(int)
+        voxel_dict = {}
+        
+        for idx, (point, feature) in enumerate(zip(points, self.feature_points)):
+            voxel_idx = tuple(voxel_indices[idx])
+            if voxel_idx not in voxel_dict:
+                voxel_dict[voxel_idx] = []
+            voxel_dict[voxel_idx].append((point, feature))
+
+        new_points = []
+        new_features = []
+        
+        for voxel_points in voxel_dict.values():
+            voxel_points.sort(key=lambda x: x[1]['response'], reverse=True)
+            best_point, best_feature = voxel_points[0]
+            new_points.append(best_point)
+            new_features.append(best_feature)
+
+        self.stored_3d_points = new_points
+        self.feature_points = new_features
+
+    def save_features(self, filepath):
+        """Save feature points to a .npz file."""
+        save_data = []
+        for feat in self.feature_points:
+            kp = feat['keypoint']
+            keypoint_data = {
+                'pt': kp.pt,
+                'size': kp.size,
+                'angle': kp.angle,
+                'response': kp.response,
+                'octave': kp.octave,
+                'class_id': kp.class_id
+            }
+            
+            save_feat = {
+                'id': feat['id'],
+                'descriptor': feat['descriptor'],
+                'point3d': feat['point3d'],
+                'keypoint': keypoint_data,
+                'response': feat['response'],
+                'size': feat['size'],
+                'angle': feat['angle'],
+                'octave': feat['octave']
+            }
+            save_data.append(save_feat)
+        
+        np.savez_compressed(
+            filepath,
+            feature_points=save_data,
+            stored_3d_points=np.array(self.stored_3d_points),
+            total_features=self.total_features
+        )
+
+    def load_features(self, filepath):
+        """Load feature points from a .npz file."""
+        data = np.load(f"{filepath}.npz", allow_pickle=True)
+        loaded_data = data['feature_points']
+        self.feature_points = []
+        
+        for feat_dict in loaded_data:
+            kp_data = feat_dict['keypoint']
+            keypoint = cv2.KeyPoint(
+                x=float(kp_data['pt'][0]),
+                y=float(kp_data['pt'][1]),
+                size=float(kp_data['size']),
+                angle=float(kp_data['angle']),
+                response=float(kp_data['response']),
+                octave=int(kp_data['octave']),
+                class_id=int(kp_data['class_id'])
+            )
+            
+            feature = {
+                'id': feat_dict['id'],
+                'descriptor': feat_dict['descriptor'],
+                'point3d': feat_dict['point3d'],
+                'keypoint': keypoint,
+                'response': feat_dict['response'],
+                'size': feat_dict['size'],
+                'angle': feat_dict['angle'],
+                'octave': feat_dict['octave']
+            }
+            self.feature_points.append(feature)
+        
+        self.stored_3d_points = data['stored_3d_points'].tolist()
+        self.total_features = int(data['total_features'])
+
+class Visualization:
+    @staticmethod
+    def draw_features(image, keypoints, matched_indices=None):
+        """Draw features on image with optional matching information."""
+        img_with_keypoints = image.copy()
+        
+        if matched_indices is None:
+            cv2.drawKeypoints(image, keypoints, img_with_keypoints, 
+                            color=(0,255,0), flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+        else:
+            unmatched_kp = [kp for i, kp in enumerate(keypoints) if i not in matched_indices]
+            cv2.drawKeypoints(image, unmatched_kp, img_with_keypoints, 
+                            color=(0,255,0), flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+            
+            matched_kp = [kp for i, kp in enumerate(keypoints) if i in matched_indices]
+            cv2.drawKeypoints(img_with_keypoints, matched_kp, img_with_keypoints, 
+                            color=(0,0,255), flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+
+        total_features = len(keypoints)
+        matched_count = len(matched_indices) if matched_indices is not None else 0
+        
+        info_text = [
+            f'Total Features: {total_features}',
+            f'Matched: {matched_count}',
+            f'Match Rate: {(matched_count/total_features*100):.1f}%' if total_features > 0 else '0%'
+        ]
+        
+        y_offset = 30
+        for text in info_text:
+            cv2.putText(img_with_keypoints, text,
+                       (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+            y_offset += 25
+        
+        return img_with_keypoints
+
+    @staticmethod
+    def plot_3d_points(verts=None, stored_points=None, current_points=None):
+        """Plot 3D points with different categories."""
+        fig = plt.figure(figsize=(10, 10))
+        ax = fig.add_subplot(111, projection='3d')
+
+        if verts is not None:
+            stride = max(1, len(verts) // 1000)
+            ax.scatter(verts[::stride, 0], 
+                      verts[::stride, 1], 
+                      verts[::stride, 2], 
+                      c='gray', alpha=0.2, s=1, label='Mesh')
+
+        if stored_points is not None and len(stored_points) > 0:
+            stored_points = np.array(stored_points)
+            ax.scatter(stored_points[:, 0], 
+                      stored_points[:, 1], 
+                      stored_points[:, 2],
+                      c='green', s=20, 
+                      alpha=0.5,
+                      label=f'Stored ({len(stored_points)})')
+
+        if current_points is not None and len(current_points) > 0:
+            ax.scatter(current_points[:, 0], 
+                      current_points[:, 1], 
+                      current_points[:, 2],
+                      c='red', s=50, 
+                      label=f'Current ({len(current_points)})')
+
+        ax.set_box_aspect([1,1,1])
+        ax.set_xlim([-1, 1])
+        ax.set_ylim([-1, 1])
+        ax.set_zlim([-1, 1])
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        ax.set_title('3D Point Visualization')
+        ax.legend()
+        
+        plt.show()
+
+class ModelUtils:
+    @staticmethod
+    def get_rotation_matrix(elevation, azimuth, yaw, device):
+        """Calculate combined rotation matrix."""
+        elevation_rad = torch.deg2rad(torch.tensor(elevation))
+        azimuth_rad = torch.deg2rad(torch.tensor(azimuth))
+        yaw_rad = torch.deg2rad(torch.tensor(yaw))
+
+        Rx = torch.tensor([
+            [1, 0, 0],
+            [0, torch.cos(elevation_rad), -torch.sin(elevation_rad)],
+            [0, torch.sin(elevation_rad), torch.cos(elevation_rad)]
+        ], device=device, dtype=torch.float32)
+
+        Ry = torch.tensor([
+            [torch.cos(azimuth_rad), 0, torch.sin(azimuth_rad)],
+            [0, 1, 0],
+            [-torch.sin(azimuth_rad), 0, torch.cos(azimuth_rad)]
+        ], device=device, dtype=torch.float32)
+
+        Rz = torch.tensor([
+            [torch.cos(yaw_rad), -torch.sin(yaw_rad), 0],
+            [torch.sin(yaw_rad), torch.cos(yaw_rad), 0],
+            [0, 0, 1]
+        ], device=device, dtype=torch.float32)
+
+        R = Rz @ Ry @ Rx
+        return R.unsqueeze(0)
+
+    @staticmethod
+    def auto_scale_and_center(meshes):
+        """Auto-scale and center the mesh."""
+        verts = meshes.verts_packed()
+        center = verts.mean(dim=0)
+        scale = verts.abs().max().item()
+        
+        meshes.offset_verts_(-center)
+        meshes.scale_verts_((1.0 / scale))
+        return meshes
 
 def detect_sift_features(image):
     """
@@ -381,3 +622,27 @@ def compute_transform_error(obj_points, est_points, R, t):
     rmse = np.sqrt(np.mean(errors**2))
     
     return errors, rmse
+
+def get_transform_distance(T1, T2):
+    """
+    Calculate the distance between two transforms.
+    Returns rotation difference in degrees and translation difference in units.
+    
+    Args:
+        T1, T2: 4x4 transformation matrices
+        
+    Returns:
+        tuple: (rotation_diff_degrees, translation_diff_magnitude)
+    """
+    R1 = Rotation.from_matrix(T1[:3, :3])
+    R2 = Rotation.from_matrix(T2[:3, :3])
+    t1 = T1[:3, 3]
+    t2 = T2[:3, 3]
+    
+    # Get rotation difference in radians
+    rot_diff = (R1.inv() * R2).magnitude()
+    
+    # Get translation difference magnitude
+    trans_diff = np.linalg.norm(t1 - t2)
+    
+    return rot_diff, trans_diff
