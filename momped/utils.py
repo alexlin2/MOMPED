@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import torch
 from scipy.spatial.transform import Rotation
+from scipy import stats
 
 class FeatureManager:
     def __init__(self):
@@ -243,13 +244,13 @@ class ModelUtils:
         meshes.scale_verts_((1.0 / scale))
         return meshes
 
-def detect_sift_features(image):
+def detect_sift_features(image, percentile=50, filter_size=3.0):
     """
     Detect SIFT features with balanced parameters.
     Args:
-        nfeatures: Maximum number of features to detect
-        contrast_threshold: Threshold for feature strength
-        edge_threshold: Threshold for edge filtering
+        image: Input image
+        percentile: Percentile threshold for response strength
+        filter_size: Minimum size threshold for keypoints
     Returns:
         keypoints: List of keypoints
         descriptors: Numpy array of descriptors
@@ -267,8 +268,8 @@ def detect_sift_features(image):
         print("No features detected")
         return None, None
     
-    # Filter based on response strength - keep top 75%
-    min_response = np.percentile([kp.response for kp in keypoints], 25)
+    # Filter based on response strength - keep top 20%
+    min_response = np.percentile([kp.response for kp in keypoints], percentile)
     
     filtered_keypoints = []
     filtered_descriptors = []
@@ -279,7 +280,7 @@ def detect_sift_features(image):
             continue
             
         # Minimal size filtering
-        if kp.size < 2.0:  # Minimum size threshold
+        if kp.size < filter_size:  # Minimum size threshold
             continue
             
         filtered_keypoints.append(kp)
@@ -294,7 +295,7 @@ def detect_sift_features(image):
     
     return filtered_keypoints, filtered_descriptors
 
-def find_matching_points(feature_points, query_descriptors):
+def find_matching_points(feature_points, query_descriptors, ratio_threshold=0.9):
     """
     Find 3D points corresponding to query feature descriptors using basic FLANN matcher.
     Args:
@@ -330,7 +331,7 @@ def find_matching_points(feature_points, query_descriptors):
     
     # Apply basic ratio test
     for i, (m, n) in enumerate(matches_flann):
-        if m.distance < 0.85 * n.distance:
+        if m.distance < ratio_threshold * n.distance:
             matches.append((i, feature_points[m.trainIdx]))
     
     print(f"Found {len(matches)} matches from {len(matches_flann)} potential matches")
@@ -634,15 +635,92 @@ def get_transform_distance(T1, T2):
     Returns:
         tuple: (rotation_diff_degrees, translation_diff_magnitude)
     """
-    R1 = Rotation.from_matrix(T1[:3, :3])
-    R2 = Rotation.from_matrix(T2[:3, :3])
+    R1 = T1[:3, :3]
+    R2 = T2[:3, :3]
     t1 = T1[:3, 3]
     t2 = T2[:3, 3]
     
+    R = np.dot(R1.T, R2)
     # Get rotation difference in radians
-    rot_diff = (R1.inv() * R2).magnitude()
+    theta = np.arccos((np.trace(R) - 1) / 2)
     
     # Get translation difference magnitude
     trans_diff = np.linalg.norm(t1 - t2)
     
-    return rot_diff, trans_diff
+    return theta, trans_diff
+
+def rotation_to_rpy_camera(T):
+    """
+    Convert rotation matrix from transform matrix T to roll-pitch-yaw angles
+    about the camera frame, assuming object z-axis up.
+    
+    Args:
+        T: 4x4 homogeneous transformation matrix
+        
+    Returns:
+        roll, pitch, yaw angles in radians
+    """
+    # Extract rotation matrix from transform
+    R = T[:3, :3]
+    
+    # Calculate pitch (rotation about y-axis)
+    pitch = np.arctan2(-R[2,0], np.sqrt(R[2,1]**2 + R[2,2]**2))
+    
+    # Calculate yaw (rotation about z-axis)
+    # Handle singularity when pitch = ±90°
+    if np.abs(pitch) > np.pi/2 - 1e-8:
+        # Gimbal lock case
+        yaw = 0  # Set yaw to zero as it's arbitrary in gimbal lock
+        # Calculate roll considering gimbal lock
+        if pitch > 0:
+            roll = np.arctan2(R[0,1], R[1,1])
+        else:
+            roll = -np.arctan2(R[0,1], R[1,1])
+    else:
+        # Normal case
+        yaw = np.arctan2(R[1,0], R[0,0])
+        roll = np.arctan2(R[2,1], R[2,2])
+    
+    return roll, pitch, yaw
+
+def filter_errors_simple(errors, min_inliers=3):
+    """
+    Filter error array using ensemble of statistical methods.
+    
+    Args:
+        errors: Array of error values
+        min_inliers: Minimum number of points to keep
+        
+    Returns:
+        mask: Boolean array, True for inliers
+    """
+    if len(errors) < min_inliers:
+        return np.ones(len(errors), dtype=bool)
+    
+    # Method 1: Z-score
+    z_scores = np.abs(stats.zscore(errors))
+    mask1 = z_scores < 2.0
+    
+    # Method 2: IQR
+    Q1 = np.percentile(errors, 25)
+    Q3 = np.percentile(errors, 75)
+    IQR = Q3 - Q1
+    mask2 = errors < (Q3 + 1.5 * IQR)
+    
+    # Method 3: Median
+    median = np.median(errors)
+    mad = np.median(np.abs(errors - median))
+    mask3 = errors < (median + 3 * mad)
+    
+    # Combine masks using majority voting
+    votes = mask1.astype(int) + mask2.astype(int) + mask3.astype(int)
+    final_mask = votes >= 2  # Point is inlier if at least 2 methods agree
+    
+    # Ensure minimum number of inliers
+    if np.sum(final_mask) < min_inliers:
+        # Fall back to method that kept the most inliers
+        counts = [np.sum(mask1), np.sum(mask2), np.sum(mask3)]
+        best_mask = [mask1, mask2, mask3][np.argmax(counts)]
+        return best_mask
+    
+    return final_mask

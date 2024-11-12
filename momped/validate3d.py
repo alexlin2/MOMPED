@@ -4,7 +4,7 @@ import cv2
 import torch
 from model3d import Model3D
 from object3d import Object3D
-from utils import get_transform_distance, visualize_alignment, compute_transform_error, ModelUtils
+from utils import get_transform_distance, visualize_alignment, compute_transform_error, rotation_to_rpy_camera, ModelUtils
 
 def main():
     parser = argparse.ArgumentParser(description='3D Model Pose Estimation Validator')
@@ -135,11 +135,22 @@ def main():
                         print(f"\nTransform Error:")
                         print(f"Rotation difference: {np.rad2deg(rot_diff):.2f} degrees")
                         print(f"Translation difference: {trans_diff:.3f} units")
-
+                        
+                        # compute in plane and out-of-plane errors
+                        out_of_plane_rotation_x, out_of_plane_rotation_y, in_plane_rotation = rotation_to_rpy_camera(T_est)
+                        out_of_plane_rotation_x_gt, out_of_plane_rotation_y_gt, in_plane_rotation_gt = rotation_to_rpy_camera(camera_to_world_gt)
+                        error_out_of_plane_x = np.arctan2(np.sin(out_of_plane_rotation_x - out_of_plane_rotation_x_gt), np.cos(out_of_plane_rotation_x - out_of_plane_rotation_x_gt))
+                        error_out_of_plane_y = np.arctan2(np.sin(out_of_plane_rotation_y - out_of_plane_rotation_y_gt), np.cos(out_of_plane_rotation_y - out_of_plane_rotation_y_gt))
+                        error_in_plane = np.arctan2(np.sin(in_plane_rotation - in_plane_rotation_gt), np.cos(in_plane_rotation - in_plane_rotation_gt))
+                        
+                        
                         # Draw error information on image
                         error_text = [
                             f"Rot diff: {np.rad2deg(rot_diff):.2f} deg",
-                            f"Trans diff: {trans_diff:.3f} m"
+                            f"Trans diff: {trans_diff:.3f} m",
+                            f"IP rot: {np.rad2deg(error_in_plane):.2f} deg",
+                            f"OP rot x: {np.rad2deg(error_out_of_plane_x):.2f} deg",
+                            f"OP rot y: {np.rad2deg(error_out_of_plane_y):.2f} deg"
                         ]
                         y_offset = 30
                         for text in error_text:
@@ -153,7 +164,7 @@ def main():
                         # Show alignment visualization
                         filtered_obj_pts = obj_pts[inliers] if inliers is not None else obj_pts
                         filtered_real_pts = real_pts[inliers] if inliers is not None else real_pts
-                        # visualize_alignment(filtered_obj_pts, filtered_real_pts, R, t)
+                        visualize_alignment(filtered_obj_pts, filtered_real_pts, R, t)
                     else:
                         print("Pose estimation failed")
                 else:

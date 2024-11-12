@@ -6,7 +6,8 @@ from momped.utils import (
     visualize_alignment, 
     compute_reprojection_error, 
     draw_frame_axes, 
-    compute_transform_error
+    compute_transform_error,
+    filter_errors_simple
 )
 import matplotlib
 from mpl_toolkits.mplot3d import Axes3D
@@ -57,7 +58,7 @@ class Object3D:
             feature = {
                 'id': feat_dict['id'],
                 'descriptor': feat_dict['descriptor'],
-                'point3d': feat_dict['point3d'] / 10.0, # Scale down to meters when in real world
+                'point3d': feat_dict['point3d'] ,#/ 10.0, # Scale down to meters when in real world
                 'keypoint': keypoint,
                 'response': feat_dict['response'],
                 'size': feat_dict['size'],
@@ -175,7 +176,7 @@ class Object3D:
                             object_points=obj_pts,
                             camera_matrix=camera_matrix,
                             dist_coeffs=dist_coeffs,
-                            ransac_threshold=10.0,
+                            ransac_threshold=6.0,
                             confidence=0.99,
                             max_iters=1000
                         )
@@ -188,38 +189,18 @@ class Object3D:
 
         R_rigid, t_rigid = self.estimate_rigid_transform_3d(filtered_obj_pts, filtered_real_pts)
 
-        _, rmse_1 = compute_transform_error(
-            obj_points=filtered_obj_pts,
-            est_points=filtered_real_pts,
-            R=R_rigid,
-            t=t_rigid
-        )
+        transformed_points = (R_rigid @ filtered_obj_pts.T).T + t_rigid
 
-        _, rmse_2 = compute_transform_error(
-            obj_points=filtered_obj_pts,
-            est_points=filtered_real_pts,
-            R=R_pnp,
-            t=t_pnp
-        )
+        error_rigid = np.linalg.norm(filtered_real_pts - transformed_points, axis=1)
 
-        _, rmse_3 = compute_transform_error(
-            obj_points=filtered_obj_pts,
-            est_points=filtered_real_pts,
-            R=R_pnp,
-            t=t_rigid
-        )
+        second_filtered_mask = filter_errors_simple(error_rigid, 3)
 
-        print(f"Rigid RMSE: {rmse_1:.3f}, PnP RMSE: {rmse_2:.3f}, Combined RMSE: {rmse_3:.3f}")
+        R, t = self.estimate_rigid_transform_3d(filtered_obj_pts[second_filtered_mask], filtered_real_pts[second_filtered_mask])
 
-        min_rmse = min(rmse_1, rmse_2, rmse_3)
+        combined_mask = np.zeros(len(obj_pts), dtype=bool)  # Initialize mask for all original points
+        combined_mask[inliers] = second_filtered_mask
 
-        if min_rmse == rmse_1:
-            return R_rigid, t_rigid, inliers
-        elif min_rmse == rmse_2:
-            return R_pnp, t_pnp, inliers
-        else:
-            return R_pnp, t_rigid, inliers
-
+        return R, t, combined_mask
 
     def estimate_pnp_ransac(self, image_points, object_points, camera_matrix, dist_coeffs=None, 
                        ransac_threshold=10.0, confidence=0.99, max_iters=1000):
@@ -305,7 +286,7 @@ class Object3D:
         t = centroid_B - R @ centroid_A
         return R, t
 
-    def estimate_transform_ransac(self, obj_points, est_points, correspondence_threshold=0.05):
+    def estimate_transform_registration_based_on_correspondence(self, obj_points, est_points, correspondence_threshold=0.05):
         """
         Estimate rigid transform between object points and estimated points using Open3D's RANSAC.
         
@@ -362,7 +343,7 @@ class Object3D:
             t = transformation[:3, 3]
 
             # Compute alignment error
-            _, rmse = self.compute_transform_error(
+            _, rmse = compute_transform_error(
                 obj_points=obj_points,
                 est_points=est_points,
                 R=R,
@@ -460,7 +441,7 @@ if __name__ == "__main__":
                 confidence=0.99
             )
         elif args.method == 'ransac':
-            R, t, inliers = obj.estimate_transform_ransac(
+            R, t, inliers = obj.estimate_transform_registration_based_on_correspondence(
                 obj_points=obj_pts,
                 est_points=real_pts,
                 correspondence_threshold=0.05
