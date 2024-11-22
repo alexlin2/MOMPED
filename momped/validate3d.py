@@ -163,9 +163,6 @@ def run_grid_validation(viewer, detector, rotation_ranges, translation_ranges=No
                     # Render frame and get depth
                     image = viewer.render_frame()
                     _, depth = viewer.get_depth_image()
-
-                    cv2.imshow('3D Model Validator', image)
-                    cv2.waitKey(1)
                     
                     # Get ground truth pose
                     _, camera_to_world_gt = viewer.get_camera_transforms()
@@ -184,6 +181,7 @@ def run_grid_validation(viewer, detector, rotation_ranges, translation_ranges=No
                         'yaw': yaw,
                         'matching_points': len(img_pts) if img_pts is not None else 0,
                         'estimation_success': False,
+                        'good_estimate': False,
                         'rotation_error_deg': None,
                         'translation_error': None,
                         'inplane_error_deg': None,
@@ -214,12 +212,12 @@ def run_grid_validation(viewer, detector, rotation_ranges, translation_ranges=No
                             cv2.circle(vis_image, tuple(pt.astype(int)), 3, (0, 255, 0), -1)
                         
                         # Estimate pose
-                        R, t, inliers = detector.estimate_transform(
-                            img_pts=img_pts,
+                        R, t, inliers = detector.estimate_pnp_ransac(
+                            image_points=img_pts,
                             obj_pts=obj_pts,
-                            real_pts=real_pts,
-                            camera_matrix=camera_matrix
+                            camera_matrix=camera_matrix,
                         )
+
                         
                         if R is not None:
                             result['estimation_success'] = True
@@ -236,6 +234,8 @@ def run_grid_validation(viewer, detector, rotation_ranges, translation_ranges=No
                             rot_diff, trans_diff = get_transform_distance(camera_to_world_gt, T_est)
                             result['rotation_error_deg'] = np.rad2deg(rot_diff)
                             result['translation_error'] = trans_diff
+                            if np.rad2deg(rot_diff) < 5.0 and result['translation_error'] < 0.02:
+                                result['good_estimate'] = True
                             
                             # Compute in-plane and out-of-plane errors
                             out_of_plane_x, out_of_plane_y, in_plane = rotation_to_rpy_camera(T_est)
@@ -264,6 +264,9 @@ def run_grid_validation(viewer, detector, rotation_ranges, translation_ranges=No
                                 cv2.putText(vis_image, text, (10, y_offset),
                                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                                 y_offset += 30
+
+                    cv2.imshow('3D Model Validator', vis_image)
+                    cv2.waitKey(1)
                     
                     if save_example_images and visualization_dir:
                         image_path = image_dir / f"pose_e{elevation:.0f}_a{azimuth:.0f}_y{yaw:.0f}.png"
@@ -288,6 +291,8 @@ def run_grid_validation(viewer, detector, rotation_ranges, translation_ranges=No
         'total_poses': len(df),
         'successful_estimations': df['estimation_success'].sum(),
         'success_rate': df['estimation_success'].mean() * 100,
+        'good_estimates': df['good_estimate'].sum(),
+        'good_estimate_rate': df['good_estimate'].sum() / df['estimation_success'].sum() * 100,
         'avg_matching_points': df['matching_points'].mean(),
         'avg_rotation_error': df[df['estimation_success']]['rotation_error_deg'].mean(),
         'avg_translation_error': df[df['estimation_success']]['translation_error'].mean(),
@@ -301,6 +306,8 @@ def run_grid_validation(viewer, detector, rotation_ranges, translation_ranges=No
     print(f"Total poses tested: {summary['total_poses']}")
     print(f"Successful estimations: {summary['successful_estimations']}")
     print(f"Success rate: {summary['success_rate']:.1f}%")
+    print(f"Good estimates: {summary['good_estimates']}")
+    print(f"Good estimate rate: {summary['good_estimate_rate']:.1f}%")
     print(f"Average matching points: {summary['avg_matching_points']:.1f}")
     print("\nError Metrics (successful estimations only):")
     print(f"Average rotation error: {summary['avg_rotation_error']:.2f}°")
@@ -451,11 +458,10 @@ def main():
                     print(f"Valid 3D points: {len(real_pts)}")
 
                     # Estimate pose using selected method
-                    R, t, inliers = detector.estimate_transform(
-                        img_pts=img_pts,
+                    R, t, inliers = detector.estimate_pnp_ransac(
+                        image_points=img_pts,
                         obj_pts=obj_pts,
-                        real_pts=real_pts,
-                        camera_matrix=camera_matrix
+                        camera_matrix=camera_matrix,
                     )
 
                     if R is not None:

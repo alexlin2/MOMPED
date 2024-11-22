@@ -81,7 +81,7 @@ class Object3D:
             mask: Binary mask for ROI
         Returns:
             image_points: 2D points in the image
-            object_points: Corresponding 3D points in object space
+            obj_pts: Corresponding 3D points in object space
         """
         if mask is None:
             return None, None
@@ -114,15 +114,15 @@ class Object3D:
         
         # Extract corresponding points
         image_points = []  # 2D points in image
-        object_points = []  # 3D points in object space
+        obj_pts = []  # 3D points in object space
         
         for query_idx, matched_feature in matches:
             # Get 2D point from keypoint
             image_points.append(keypoints[query_idx].pt)
             # Get corresponding 3D point
-            object_points.append(matched_feature['point3d'])
+            obj_pts.append(matched_feature['point3d'])
         
-        return np.array(image_points), np.array(object_points)
+        return np.array(image_points), np.array(obj_pts)
     
     def estimate3d(self, image_points, depth_image, camera_matrix, dist_coeffs=None):
         """
@@ -165,22 +165,22 @@ class Object3D:
         
         return np.column_stack((X, Y, Z)), depth_mask
  
-    def estimate_transform(self, img_pts, obj_pts, real_pts, camera_matrix, dist_coeffs=None):
+    def estimate_transform(self, obj_pts, real_pts, inlier_threshold=0.03):
         '''
-        Combine PnP RANSAC and rigid transform estimation to get the best pose estimate.
-        uses transform error as loss function to select the best estimate.
+        Estimate 6D pose by first filtering out mis-matched SIFT features by using 
+        relative distance error between real points and object points. Then using Kabsch algorithm
+        to find the rigid transformation between the filtered points.
         '''
         
-        R_pnp, t_pnp, inliers = self.estimate_pnp_ransac(
-                            image_points=img_pts,
-                            object_points=obj_pts,
-                            camera_matrix=camera_matrix,
-                            dist_coeffs=dist_coeffs,
-                            ransac_threshold=6.0,
-                            confidence=0.99,
-                            max_iters=1000
-                        )
+        rel_dist_obj = np.linalg.norm(obj_pts[:, np.newaxis] - obj_pts, axis=2)
+        np.fill_diagonal(rel_dist_obj, np.inf)  # Ignore self-distance
         
+        rel_dist_real = np.linalg.norm(real_pts[:, np.newaxis] - real_pts, axis=2)
+        np.fill_diagonal(rel_dist_real, np.inf)  # Ignore self-distance
+
+        dist_error = np.abs(rel_dist_obj - rel_dist_real)
+        inliers = np.sum(dist_error < inlier_threshold, axis=1) >= 4
+
         filtered_obj_pts = obj_pts[inliers]
         filtered_real_pts = real_pts[inliers]
 
@@ -202,18 +202,18 @@ class Object3D:
 
         return R, t, combined_mask
 
-    def estimate_pnp_ransac(self, image_points, object_points, camera_matrix, dist_coeffs=None, 
+    def estimate_pnp_ransac(self, image_points, obj_pts, camera_matrix, dist_coeffs=None, 
                        ransac_threshold=10.0, confidence=0.99, max_iters=1000):
         """
         Estimate 6D pose using PnP RANSAC.
         """
 
-        if len(image_points) != len(object_points) or len(image_points) < 4:
+        if len(image_points) != len(obj_pts) or len(image_points) < 4:
             return None, None, None
             
         # Ensure points are float32
         image_points = image_points.astype(np.float32)
-        object_points = object_points.astype(np.float32)
+        obj_pts = obj_pts.astype(np.float32)
         
         # If no distortion coefficients provided, use zero distortion
         if dist_coeffs is None:
@@ -223,7 +223,7 @@ class Object3D:
             # Estimate pose using RANSAC
             
             retval, rvec, tvec, inliers = cv2.solvePnPRansac(
-                objectPoints=object_points,
+                objectPoints=obj_pts,
                 imagePoints=image_points,
                 cameraMatrix=camera_matrix,
                 distCoeffs=dist_coeffs,
@@ -255,7 +255,7 @@ class Object3D:
             print(f"Error in estimate_pnp_ransac: {e}")
             return None, None, None
     
-    def estimate_rigid_transform_3d(self, object_points, estimated_points):
+    def estimate_rigid_transform_3d(self, obj_pts, real_pts):
         """
         Estimate a 3D rigid transformation (rotation and translation) that aligns 
         set of points A to set of points B.
@@ -266,13 +266,13 @@ class Object3D:
             R (np.ndarray): 3x3 rotation matrix.
             t (np.ndarray): 3x1 translation vector.
         """
-        assert object_points.shape == estimated_points.shape, "A and B must be of the same shape"
+        assert obj_pts.shape == real_pts.shape, "A and B must be of the same shape"
         # Calculate centroids
-        centroid_A = np.mean(object_points, axis=0)
-        centroid_B = np.mean(estimated_points, axis=0)
+        centroid_A = np.mean(obj_pts, axis=0)
+        centroid_B = np.mean(real_pts, axis=0)
         # Center the points
-        AA = object_points - centroid_A
-        BB = estimated_points - centroid_B
+        AA = obj_pts - centroid_A
+        BB = real_pts - centroid_B
         # Calculate covariance matrix
         H = AA.T @ BB
         # Perform SVD
@@ -435,7 +435,7 @@ if __name__ == "__main__":
         elif args.method == 'pnp':
             R, t, inliers = obj.estimate_pnp_ransac(
                 image_points=img_pts,
-                object_points=obj_pts,
+                obj_pts=obj_pts,
                 camera_matrix=camera_matrix,
                 ransac_threshold=10.0,
                 confidence=0.99
@@ -458,7 +458,7 @@ if __name__ == "__main__":
             if args.method in ['pnp', 'combined']:
                 errors, rmse, vis_img = compute_reprojection_error(
                     image_points=img_pts[inliers] if args.method == 'pnp' else img_pts,
-                    object_points=obj_pts[inliers] if args.method == 'pnp' else obj_pts,
+                    obj_pts=obj_pts[inliers] if args.method == 'pnp' else obj_pts,
                     R=R,
                     t=t,
                     camera_matrix=camera_matrix,
