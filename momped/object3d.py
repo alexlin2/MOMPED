@@ -58,7 +58,7 @@ class Object3D:
             feature = {
                 'id': feat_dict['id'],
                 'descriptor': feat_dict['descriptor'],
-                'point3d': feat_dict['point3d'] ,#/ 10.0, # Scale down to meters when in real world
+                'point3d': feat_dict['point3d'] / 10.0, # Scale down to meters when in real world
                 'keypoint': keypoint,
                 'response': feat_dict['response'],
                 'size': feat_dict['size'],
@@ -165,7 +165,7 @@ class Object3D:
         
         return np.column_stack((X, Y, Z)), depth_mask
  
-    def estimate_transform(self, obj_pts, real_pts, inlier_threshold=0.03):
+    def estimate_transform(self, obj_pts, real_pts, inlier_threshold=0.01):
         '''
         Estimate 6D pose by first filtering out mis-matched SIFT features by using 
         relative distance error between real points and object points. Then using Kabsch algorithm
@@ -179,7 +179,7 @@ class Object3D:
         np.fill_diagonal(rel_dist_real, np.inf)  # Ignore self-distance
 
         dist_error = np.abs(rel_dist_obj - rel_dist_real)
-        inliers = np.sum(dist_error < inlier_threshold, axis=1) >= 4
+        inliers = np.sum(dist_error < inlier_threshold, axis=1) >= max(len(obj_pts) / 3, 5)
 
         filtered_obj_pts = obj_pts[inliers]
         filtered_real_pts = real_pts[inliers]

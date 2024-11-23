@@ -295,7 +295,7 @@ def detect_sift_features(image, percentile=50, filter_size=3.0):
     
     return filtered_keypoints, filtered_descriptors
 
-def find_matching_points(feature_points, query_descriptors, ratio_threshold=0.9):
+def find_matching_points(feature_points, query_descriptors, ratio_threshold=0.85):
     """
     Find 3D points corresponding to query feature descriptors using basic FLANN matcher.
     Args:
