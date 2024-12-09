@@ -212,9 +212,10 @@ def run_grid_validation(viewer, detector, rotation_ranges, translation_ranges=No
                             cv2.circle(vis_image, tuple(pt.astype(int)), 3, (0, 255, 0), -1)
                         
                         # Estimate pose
-                        R, t, inliers = detector.estimate_pnp_ransac(
-                            image_points=img_pts,
+                        R, t, inliers = detector.estimate_transform(
+                            real_pts=real_pts,
                             obj_pts=obj_pts,
+                            img_pts=img_pts,
                             camera_matrix=camera_matrix,
                         )
 
@@ -458,9 +459,10 @@ def main():
                     print(f"Valid 3D points: {len(real_pts)}")
 
                     # Estimate pose using selected method
-                    R, t, inliers = detector.estimate_pnp_ransac(
-                        image_points=img_pts,
+                    R, t, inliers = detector.estimate_transform(
+                        real_pts=real_pts,
                         obj_pts=obj_pts,
+                        img_pts=img_pts,
                         camera_matrix=camera_matrix,
                     )
 

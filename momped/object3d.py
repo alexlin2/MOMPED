@@ -165,7 +165,7 @@ class Object3D:
         
         return np.column_stack((X, Y, Z)), depth_mask
  
-    def estimate_transform(self, obj_pts, real_pts, inlier_threshold=0.01):
+    def estimate_transform(self, obj_pts, real_pts, img_pts, camera_matrix, inlier_threshold=0.01):
         '''
         Estimate 6D pose by first filtering out mis-matched SIFT features by using 
         relative distance error between real points and object points. Then using Kabsch algorithm
@@ -179,7 +179,21 @@ class Object3D:
         np.fill_diagonal(rel_dist_real, np.inf)  # Ignore self-distance
 
         dist_error = np.abs(rel_dist_obj - rel_dist_real)
-        inliers = np.sum(dist_error < inlier_threshold, axis=1) >= max(len(obj_pts) / 3, 5)
+        inliers_dist = np.sum(dist_error < inlier_threshold, axis=1) >= 5
+
+        R_pnp, t_pnp, inliers_pnp = self.estimate_pnp_ransac(
+                            img_pts=img_pts,
+                            obj_pts=obj_pts,
+                            camera_matrix=camera_matrix,
+                            ransac_threshold=6.0,
+                            confidence=0.99,
+                            max_iters=1000
+                        )
+        
+        if inliers_pnp is None:
+            return None, None, None
+
+        inliers = inliers_dist & inliers_pnp
 
         filtered_obj_pts = obj_pts[inliers]
         filtered_real_pts = real_pts[inliers]
@@ -202,17 +216,17 @@ class Object3D:
 
         return R, t, combined_mask
 
-    def estimate_pnp_ransac(self, image_points, obj_pts, camera_matrix, dist_coeffs=None, 
+    def estimate_pnp_ransac(self, img_pts, obj_pts, camera_matrix, dist_coeffs=None, 
                        ransac_threshold=10.0, confidence=0.99, max_iters=1000):
         """
         Estimate 6D pose using PnP RANSAC.
         """
 
-        if len(image_points) != len(obj_pts) or len(image_points) < 4:
+        if len(img_pts) != len(obj_pts) or len(img_pts) < 4:
             return None, None, None
             
         # Ensure points are float32
-        image_points = image_points.astype(np.float32)
+        img_pts = img_pts.astype(np.float32)
         obj_pts = obj_pts.astype(np.float32)
         
         # If no distortion coefficients provided, use zero distortion
@@ -224,14 +238,13 @@ class Object3D:
             
             retval, rvec, tvec, inliers = cv2.solvePnPRansac(
                 objectPoints=obj_pts,
-                imagePoints=image_points,
+                imagePoints=img_pts,
                 cameraMatrix=camera_matrix,
                 distCoeffs=dist_coeffs,
                 flags=cv2.SOLVEPNP_EPNP,
                 iterationsCount=max_iters,
                 reprojectionError=ransac_threshold,
                 confidence=confidence,
-                inliers=None
             )
             
             if not retval or inliers is None:
@@ -243,7 +256,7 @@ class Object3D:
             t = tvec.reshape(3)
             
             # Create inlier mask
-            inlier_mask = np.zeros(len(image_points), dtype=bool)
+            inlier_mask = np.zeros(len(img_pts), dtype=bool)
             inlier_mask[inliers.ravel()] = True
             
             return R, t, inlier_mask

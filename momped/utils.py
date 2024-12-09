@@ -291,8 +291,8 @@ def detect_sift_features(image, percentile=50, filter_size=3.0):
         return None, None
         
     filtered_descriptors = np.array(filtered_descriptors)
-    print(f"Detected {len(filtered_keypoints)} filtered SIFT features")
-    
+    #print(f"Detected {len(filtered_keypoints)} filtered SIFT features")
+
     return filtered_keypoints, filtered_descriptors
 
 def find_matching_points(feature_points, query_descriptors, ratio_threshold=0.85):
@@ -334,7 +334,7 @@ def find_matching_points(feature_points, query_descriptors, ratio_threshold=0.85
         if m.distance < ratio_threshold * n.distance:
             matches.append((i, feature_points[m.trainIdx]))
     
-    print(f"Found {len(matches)} matches from {len(matches_flann)} potential matches")
+    #print(f"Found {len(matches)} matches from {len(matches_flann)} potential matches")
     return matches
 
 def visualize_3d_points(feature_points=None, current_points=None):
