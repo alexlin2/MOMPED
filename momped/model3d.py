@@ -1,7 +1,8 @@
 import torch
 import numpy as np
 import cv2
-from pytorch3d.io import load_objs_as_meshes
+from pytorch3d.io import load_objs_as_meshes, load_ply
+from pytorch3d.structures import Meshes
 from pytorch3d.renderer import (
     FoVPerspectiveCameras,
     RasterizationSettings,
@@ -9,9 +10,12 @@ from pytorch3d.renderer import (
     MeshRasterizer,
     SoftPhongShader,
     PointLights,
+    TexturesUV,
+    TexturesVertex
 )
 import matplotlib
 matplotlib.use('TkAgg')
+import trimesh
 
 from utils import (
     detect_sift_features, 
@@ -21,14 +25,21 @@ from utils import (
     ModelUtils
 )
 
-
 class Model3D:
-    def __init__(self, obj_path, auto_scan=False, scan_distance=6.0):
+    def __init__(self, model_path, auto_scan=False, scan_distance=6.0):
+        """
+        Initialize Model3D with support for PLY and OBJ files, and texture mapping.
+        
+        Args:
+            model_path: Path to the model file (.ply or .obj)
+            auto_scan: Whether to automatically scan the object
+            scan_distance: Distance for scanning/viewing
+        """
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         print(f"Using {self.device}")
 
-        print("Loading OBJ file...")
-        self.meshes = load_objs_as_meshes([obj_path], device=self.device)
+        print("Loading model file...")
+        self.meshes = self.load_model(model_path)
         
         if self.meshes.isempty():
             raise ValueError("Failed to load mesh!")
@@ -51,7 +62,60 @@ class Model3D:
         self.feature_manager = FeatureManager()
         self.init_renderer()
 
+    def load_model(self, model_path):
+        """
+        Load model from PLY or OBJ file with optional texture mapping.
+        
+        Args:
+            model_path: Path to model file (.ply or .obj)
+            texture_path: Optional path to texture image (.png)
+            
+        Returns:
+            Meshes object with loaded model
+        """
+        if model_path.lower().endswith('.ply'):
+            # Load PLY file
+            verts, faces = load_ply(model_path)
+            mesh_trimesh = trimesh.load(model_path)
+
+            # Move vertices and faces to specified device
+            verts = verts.to(self.device)
+            faces = faces.to(self.device)
+
+            texture_path = model_path.replace('.ply', '.png')
+            
+            # Load and process texture image
+            texture_image = cv2.imread(texture_path)
+            texture_image = cv2.cvtColor(texture_image, cv2.COLOR_BGR2RGB)
+            texture_image = torch.from_numpy(texture_image).float().to(self.device) / 255.0
+
+            # Get UV coordinates
+            verts_uvs = torch.tensor(mesh_trimesh.visual.uv, dtype=torch.float32, device=self.device)
+            
+            # YCB-Video dataset uses face-vertex UV format, so we need to create the faces_uvs
+            faces_uvs = faces.clone()
+
+            # Create TexturesUV
+            textures = TexturesUV(
+                maps=[texture_image],
+                faces_uvs=[faces_uvs],
+                verts_uvs=[verts_uvs]
+            )
+
+            # Create mesh with vertices, faces and textures
+            meshes = Meshes(
+                verts=[verts.to(self.device)],
+                faces=[faces.to(self.device)],
+                textures=textures
+            )
+
+        else:  # Assume OBJ file
+            meshes = load_objs_as_meshes([model_path], device=self.device)
+
+        return meshes
+
     def init_renderer(self):
+        """Initialize the PyTorch3D renderer with the current settings."""
         self.cameras = FoVPerspectiveCameras(device=self.device, fov=60.0)
         
         self.raster_settings = RasterizationSettings(
@@ -256,7 +320,7 @@ class Model3D:
         
         return points3d, np.array(valid_descriptors), valid_keypoints
 
-    def grid_capture(self, elevation_range=(-45, 45), elevation_steps=5,
+    def grid_capture(self, elevation_range=(-60, 60), elevation_steps=10,
                     yaw_range=(-45, 45), yaw_steps=5,
                     save_path="grid_features"):
         """Systematically capture features from a grid of viewpoints."""
@@ -349,11 +413,11 @@ def main():
 
         if viewer.auto_scan:
             viewer.grid_capture(
-                elevation_range=(-25, 25),
+                elevation_range=(-60, 60),
                 elevation_steps=20,
                 yaw_range=(0, 360),
-                yaw_steps=5,
-                save_path="grid_features"
+                yaw_steps=20,
+                save_path=args.features_path
             )
 
         camera_matrix, width, height = viewer.get_camera_intrinsics()
