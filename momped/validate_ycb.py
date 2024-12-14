@@ -1,9 +1,9 @@
 import argparse
 import numpy as np
 import cv2
-import json
-import torch
 import os
+import time
+import csv
 from pathlib import Path
 from tqdm import tqdm
 from object3d import Object3D
@@ -13,33 +13,21 @@ from bop_toolkit_lib import inout
 from bop_toolkit_lib import misc
 from bop_toolkit_lib import visualization
 
-class YCBEvaluator:
-    def __init__(self, dataset_path, object_id, model_root):
-        """
-        Initialize YCB-Video dataset evaluator.
-        
-        Args:
-            dataset_path: Path to YCB-Video dataset root
-            object_id: Object ID to evaluate
-            model_root: Path to YCB object models
-        """
+class YCBBatchEvaluator:
+    def __init__(self, dataset_path, model_root):
         self.dataset_path = dataset_path
-        self.object_id = int(object_id)
-        self.object_id_str = str(object_id).zfill(6)
-        
-        # Load model
-        model_path = Path(model_root) / f"obj_{self.object_id_str}"
-        
-        # Initialize model and detector
-        self.detector = Object3D(str(model_path) + ".npz")
-        
-        # For visualization
+        self.model_root = Path(model_root)
         self.window_name = "YCB-Video Pose Estimation"
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        
+        # For storing BOP format results
+        self.results = []
+        # For storing statistics
+        self.statistics = []
 
-    def load_frame_data(self, scene_id, frame_id):
+    def load_frame_data(self, scene_id, frame_id, object_id):
         """Load RGB, depth, mask, and pose data for a frame."""
-        # Scene paths using exact structure from ycb_loader.py
+        # Scene paths
         scene_path = os.path.join(self.dataset_path, 'test', f'{scene_id:06d}')
         rgb_file = os.path.join(scene_path, 'rgb', f'{frame_id:06d}.png')
         depth_file = os.path.join(scene_path, 'depth', f'{frame_id:06d}.png')
@@ -80,7 +68,7 @@ class YCBEvaluator:
         
         if str_frame_id in scene_gt:
             for gt_id, gt in enumerate(scene_gt[str_frame_id]):
-                if gt['obj_id'] == self.object_id:
+                if gt['obj_id'] == object_id:
                     # Load mask
                     mask_file = os.path.join(scene_path, 'mask_visib', 
                                            f'{frame_id:06d}_{gt_id:06d}.png')
@@ -97,21 +85,23 @@ class YCBEvaluator:
                     break
 
         if not gt_found:
-            print(f"Object {self.object_id} not found in frame {frame_id}")
             return None, None, None, None, None, None
             
         return rgb, depth, mask, R, t, camera_matrix
 
-    def process_frame(self, rgb, depth, mask, gt_R, gt_t, camera_matrix):
+    def process_frame(self, rgb, depth, mask, gt_R, gt_t, camera_matrix, detector):
         """Process a single frame and estimate pose."""
+        # Start timing
+        start_time = time.time()
+        
         # Get matching points using the dataset mask
-        img_pts, obj_pts = self.detector.match_image_points(rgb, mask)
+        img_pts, obj_pts = detector.match_image_points(rgb, mask)
         
         if img_pts is None or len(img_pts) < 4:
-            return None, None, None, None, None, None
+            return None, None, None, None, None, None, 0.0
             
         # Get 3D points from depth
-        real_pts, valid_indices = self.detector.estimate3d(
+        real_pts, valid_indices = detector.estimate3d(
             img_pts, depth, camera_matrix
         )
         
@@ -121,16 +111,53 @@ class YCBEvaluator:
         img_pts = img_pts[valid_indices]
         
         # Estimate pose
-        R, t, inliers = self.detector.estimate_transform(
+        R, t, inliers = detector.estimate_transform(
             real_pts=real_pts,
             obj_pts=obj_pts,
             img_pts=img_pts,
             camera_matrix=camera_matrix,
         )
         
-        return R, t, inliers, img_pts, obj_pts, real_pts
+        # Calculate total processing time
+        process_time = time.time() - start_time
+        score = 1.0 if R is not None else 0.0
+        
+        return R, t, inliers, img_pts, obj_pts, real_pts, score, process_time
+    
+    def visualize_all(self, rgb, mask, depth, img_pts, frame_id):
+        # Create mask visualization
+        mask_vis = np.zeros_like(rgb)
+        mask_vis[mask > 0] = [0, 255, 0]  # Green mask
 
-    def visualize_results(self, frame, mask, R_pred, t_pred, R_gt, t_gt, camera_matrix, inliers=None):
+        rgb_overlay = rgb.copy()
+        # Draw keypoints on the overlay
+        if img_pts is not None and len(img_pts) > 0:
+            for pt in img_pts:
+                x, y = int(pt[0]), int(pt[1])
+                cv2.circle(rgb_overlay, (x, y), 3, (0, 0, 255), -1)  # Red dots for keypoints
+
+        # Normalize and colorize depth for visualization
+        depth_vis = np.zeros_like(rgb)
+        if depth is not None:
+            depth_valid = depth > 0
+            if depth_valid.sum() > 0:
+                depth_norm = depth.copy()
+                depth_norm[depth_valid] = (depth_norm[depth_valid] - depth_norm[depth_valid].min()) / \
+                                        (depth_norm[depth_valid].max() - depth_norm[depth_valid].min())
+                depth_vis = (depth_norm * 255).astype(np.uint8)
+                depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
+
+        # Add frame counter to RGB image
+        cv2.putText(rgb_overlay, f"Frame: {frame_id}", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                   
+        # Stack images horizontally
+        vis_img = np.hstack([rgb_overlay, depth_vis, mask_vis])
+        
+        # Display
+        cv2.imshow('BOP Dataset Viewer (RGB | Depth | Mask)', vis_img)
+    
+    def visualize_frame(self, frame, mask, R_pred, t_pred, R_gt, t_gt, camera_matrix, inliers=None):
         """Visualize pose estimation results."""
         # Create visualization image
         vis_img = frame.copy()
@@ -172,7 +199,6 @@ class YCBEvaluator:
         
         # Add error information
         info_text = [
-            f"Object ID: {self.object_id}",
             f"Rotation Error: {rot_diff_deg:.2f} deg",
             f"Translation Error: {trans_diff*1000:.1f} mm",
             f"Pred RPY: {np.rad2deg(rpy_pred[0]):.1f}, {np.rad2deg(rpy_pred[1]):.1f}, {np.rad2deg(rpy_pred[2]):.1f}",
@@ -185,121 +211,193 @@ class YCBEvaluator:
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             y_offset += 30
             
-        return vis_img
-
-    def evaluate_sequence(self, scene_id, start_frame=1, end_frame=None):
-        """Evaluate a sequence of frames."""
-        errors = []
+        cv2.imshow(self.window_name, vis_img)
         
-        # Get frame paths
+        return vis_img
+        
+    def evaluate_scene_range(self, start_scene, end_scene, visualize=False):
+        """Evaluate a range of scenes."""
+        for scene_id in range(start_scene, end_scene + 1):
+            print(f"\nProcessing scene {scene_id}")
+            self.evaluate_scene(scene_id, visualize)
+            
+    def evaluate_scene(self, scene_id, visualize=False):
+        """Evaluate all objects in a scene."""
+        scene_path = os.path.join(self.dataset_path, 'test', f'{scene_id:06d}')
+        scene_gt = inout.load_scene_gt(os.path.join(scene_path, 'scene_gt.json'))
+        
+        if not scene_gt:
+            print(f"No ground truth found for scene {scene_id}")
+            return
+            
+        # Get unique object IDs in the scene
+        object_ids = set()
+        for frame_data in scene_gt.values():
+            for gt in frame_data:
+                object_ids.add(gt['obj_id'])
+                
+        print(f"Found {len(object_ids)} unique objects in scene {scene_id}")
+        
+        # Process each object
+        for obj_id in object_ids:
+            print(f"\nProcessing object {obj_id} in scene {scene_id}")
+            self.evaluate_object_in_scene(scene_id, obj_id, visualize)
+            
+    def evaluate_object_in_scene(self, scene_id, object_id, visualize=False):
+        """Evaluate a single object across all frames in a scene."""
+        # Initialize object detector
+        model_path = self.model_root / f"obj_{object_id:06d}.npz"
+        if not model_path.exists():
+            print(f"Model file not found for object {object_id}")
+            return
+            
+        detector = Object3D(str(model_path))
+        
+        # Collect frame statistics
+        angle_errors = []
+        trans_errors = []
+        total_frames = 0
+        successful_estimates = 0
+        true_positives = 0
+        false_positives = 0
+        false_negatives = 0
+        
+        # Process each frame
         scene_path = os.path.join(self.dataset_path, 'test', f'{scene_id:06d}')
         rgb_path = os.path.join(scene_path, 'rgb')
-        frame_paths = sorted([f for f in os.listdir(rgb_path) if f.endswith('.png')])
+        frames = sorted([int(f.split('.')[0]) for f in os.listdir(rgb_path) if f.endswith('.png')])
         
-        if end_frame is None:
-            end_frame = len(frame_paths)
-            
-        frame_indices = range(start_frame, end_frame)
-        
-        for frame_idx in tqdm(frame_indices, desc=f"Processing scene {scene_id}"):
-            # Load frame data
+        for frame_id in tqdm(frames, desc=f"Scene {scene_id} Object {object_id}"):
             rgb, depth, mask, gt_R, gt_t, camera_matrix = self.load_frame_data(
-                scene_id, frame_idx
-            )
-            
+                scene_id, frame_id, object_id)
+                
             if rgb is None:
                 continue
                 
+            total_frames += 1
+            
             # Process frame
-            R_pred, t_pred, inliers, img_pts, obj_pts, real_pts = self.process_frame(
-                rgb, depth, mask, gt_R, gt_t, camera_matrix
-            )
+            results = self.process_frame(
+                rgb, depth, mask, gt_R, gt_t, camera_matrix, detector)
+            
+            if visualize:
+                self.visualize_all(rgb, mask, depth, results[3], frame_id)
+                
+            if results[0] is not None:
+                R_pred, t_pred, inliers = results[:3]
+                successful_estimates += 1
+                
+                # Calculate errors
+                T_pred = np.eye(4)
+                T_pred[:3, :3] = R_pred
+                T_pred[:3, 3] = t_pred
+                
+                T_gt = np.eye(4)
+                T_gt[:3, :3] = gt_R
+                T_gt[:3, 3] = gt_t.flatten()
+                
+                rot_diff, trans_diff = get_transform_distance(T_gt, T_pred)
+                rot_diff_deg = np.rad2deg(rot_diff)
+                
+                angle_errors.append(rot_diff_deg)
+                trans_errors.append(trans_diff * 1000)  # Convert to mm
 
-            vis_img = rgb.copy()
-            if img_pts is not None:
-                for pt in img_pts:
-                    cv2.circle(vis_img, tuple(map(int, pt)), 5, (255, 0, 0), -1)
-            if R_pred is not None:
-                vis_img = self.visualize_results(
-                    vis_img, mask, R_pred, t_pred, gt_R, gt_t, camera_matrix, inliers
-                )
-                #visualize_alignment(obj_pts, real_pts, R_pred, t_pred)
+                if visualize:
+                    self.visualize_frame(rgb, mask, R_pred, t_pred, gt_R, gt_t, camera_matrix)
+                
+                # Update precision/recall metrics
+                if rot_diff_deg < 10.0 and trans_diff < 0.05:  # 10 degrees and 5cm thresholds
+                    true_positives += 1
+                else:
+                    false_positives += 1
             else:
-                print(f"Failed to estimate pose for frame {frame_idx}")
+                false_negatives += 1
+            
+            cv2.waitKey(1)
                 
-            # Visualize results
+        # Calculate statistics
+        if angle_errors:
+            mean_angle_error = np.mean(angle_errors)
+            mean_trans_error = np.mean(trans_errors)
+            std_angle_error = np.std(angle_errors)
+            std_trans_error = np.std(trans_errors)
+            percent_success = (successful_estimates / total_frames) * 100
             
-            cv2.imshow(self.window_name, vis_img)
-            depth_vis = depth.copy()
-            valid_mask = mask > 0.0
-            valid_depths = depth[valid_mask]
-            min_depth = valid_depths.min()
-            max_depth = valid_depths.max()
+            precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
+            recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
             
-            depth_vis[valid_mask] = ((depth_vis[valid_mask] - min_depth) / 
-                                    (max_depth - min_depth) * 255)
-            depth_vis = depth_vis.astype(np.uint8)
-            depth_colored = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
-            # Add min/max depth text overlay
-            cv2.putText(depth_colored, f"Min depth: {min_depth:.3f}m", 
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(depth_colored, f"Max depth: {max_depth:.3f}m",
-                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.imshow('depth', depth_colored)
-            key = cv2.waitKey(1)
-            if key == ord('q'):
-                break
-            
-            if R_pred is None:
-                continue
-            # Calculate errors
-            T_pred = np.eye(4)
-            T_pred[:3, :3] = R_pred
-            T_pred[:3, 3] = t_pred
-            
-            T_gt = np.eye(4)
-            T_gt[:3, :3] = gt_R
-            T_gt[:3, 3] = gt_t.flatten()
-            
-            rot_diff, trans_diff = get_transform_distance(T_gt, T_pred)
-            
-            errors.append({
-                'frame': frame_idx,
-                'rotation_error_deg': np.rad2deg(rot_diff),
-                'translation_error_mm': trans_diff * 1000,
+            self.statistics.append({
+                'scene_id': scene_id,
+                'object_id': object_id,
+                'mean_angle_error': mean_angle_error,
+                'mean_trans_error': mean_trans_error,
+                'std_angle_error': std_angle_error,
+                'std_trans_error': std_trans_error,
+                'percent_success_estimate': percent_success,
+                'precision_rate': precision * 100,
+                'recall_rate': recall * 100
             })
+
+    def save_bop_results(self, output_path):
+        """Save results in BOP challenge format CSV."""
+        with open(output_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            # Write header
+            writer.writerow(['scene_id', 'im_id', 'obj_id', 'score', 'R', 't', 'time'])
+            
+            for result in self.results:
+                # Format rotation matrix: 9 values with 6 decimal places
+                R_str = ' '.join([f"{x:.6f}" for x in result['R'].flatten()])
                 
-        return errors
+                # Format translation vector: 3 values with 6 decimal places
+                t_str = ' '.join([f"{x:.6f}" for x in result['t'].flatten()])
+                
+                # Write row with exactly matching format
+                writer.writerow([
+                    result['scene_id'],
+                    result['im_id'],
+                    result['obj_id'],
+                    f"{result['score']:.2f}",  # Score to 2 decimal places
+                    R_str,
+                    t_str,
+                    f"{result['time']:.4f}"   # Time to 4 decimal places
+                ])
+            
+    def save_statistics(self, output_path):
+        """Save statistics to CSV file."""
+        fieldnames = ['scene_id', 'object_id', 'mean_angle_error', 'mean_trans_error',
+                     'std_angle_error', 'std_trans_error', 'percent_success_estimate',
+                     'precision_rate', 'recall_rate']
+                     
+        with open(output_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for stat in self.statistics:
+                writer.writerow(stat)
 
 def main():
-    parser = argparse.ArgumentParser(description='YCB-Video Dataset Pose Estimation Evaluation')
+    parser = argparse.ArgumentParser(description='YCB-Video Dataset Batch Evaluation')
     parser.add_argument('--dataset_path', required=True, help='Path to YCB-Video dataset root')
     parser.add_argument('--models', required=True, help='Path to YCB object models')
-    parser.add_argument('--object_id', required=True, type=int, help='Object ID to evaluate')
-    parser.add_argument('--scene_id', type=int, required=True, help='Scene ID to evaluate')
-    parser.add_argument('--start', type=int, default=1, help='Start frame')
-    parser.add_argument('--end', type=int, default=None, help='End frame')
-    parser.add_argument('--output', help='Path to save evaluation results')
+    parser.add_argument('--start_scene', type=int, required=True, help='Starting scene ID')
+    parser.add_argument('--end_scene', type=int, required=True, help='Ending scene ID')
+    parser.add_argument('--output', required=True, help='Path to save BOP format results')
+    parser.add_argument('--stats_output', required=True, help='Path to save statistics CSV')
+    parser.add_argument('--visualize', action='store_true', help='Enable visualization')
     
     args = parser.parse_args()
     
-    evaluator = YCBEvaluator(args.dataset_path, args.object_id, args.models)
-    errors = evaluator.evaluate_sequence(args.scene_id, args.start, args.end)
+    evaluator = YCBBatchEvaluator(args.dataset_path, args.models)
     
-    if args.output:
-        with open(args.output, 'w') as f:
-            json.dump(errors, f, indent=2)
-            
-        # Print summary statistics
-        rot_errors = [e['rotation_error_deg'] for e in errors]
-        trans_errors = [e['translation_error_mm'] for e in errors]
-        
-        print("\nEvaluation Summary:")
-        print(f"Frames processed: {len(errors)}")
-        print(f"Average rotation error: {np.mean(rot_errors):.2f}° ± {np.std(rot_errors):.2f}°")
-        print(f"Average translation error: {np.mean(trans_errors):.1f} ± {np.std(trans_errors):.1f} mm")
-        print(f"Median rotation error: {np.median(rot_errors):.2f}°")
-        print(f"Median translation error: {np.median(trans_errors):.1f} mm")
+    # Process all scenes
+    evaluator.evaluate_scene_range(args.start_scene, args.end_scene, args.visualize)
+    
+    # Save results
+    evaluator.save_bop_results(args.output)
+    evaluator.save_statistics(args.stats_output)
+    
+    print(f"\nResults saved in BOP format to: {args.output}")
+    print(f"Statistics saved to: {args.stats_output}")
 
 if __name__ == "__main__":
     main()

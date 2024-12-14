@@ -3,3 +3,5 @@
 /build
 /momped/__pycache__
 /__pycache__
+/output
+/validation_results
